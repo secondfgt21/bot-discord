@@ -13,6 +13,7 @@ import {
 } from 'discord.js';
 import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { ensurePeriodExists, type AppDb } from './db.ts';
+import { isNonComicChannel } from './parser.ts';
 import {
   closePayrollPeriod,
   correctReportChapter,
@@ -102,6 +103,8 @@ export function formatReportAcceptedMessage(params: {
   projectTitle?: string | null;
   chapterDisplay?: string | null;
   totalChapters?: number;
+  isPending?: boolean;
+  pendingReason?: string | null;
 }): string {
   const title = params.projectTitle?.trim() || '-';
   const chapter = params.chapterDisplay?.trim() || '-';
@@ -110,12 +113,23 @@ export function formatReportAcceptedMessage(params: {
       ? Math.max(0, Math.trunc(params.totalChapters))
       : 0;
 
-  return [
+  const lines = [
     `<@${params.discordAuthorId}> Laporan Diterima`,
     `judul : ${title}`,
     `chapter : ${chapter}`,
     `total chapter : ${totalChapter}`,
-  ].join('\n');
+    '',
+  ];
+
+  if (params.isPending) {
+    const reason = params.pendingReason?.trim() || 'Laporan memerlukan pemeriksaan admin.';
+    lines.push('Laporan Kamu : Pending');
+    lines.push(`pesan : ${reason}`);
+  } else {
+    lines.push('Laporan kamu : sukses tercatat');
+  }
+
+  return lines.join('\n');
 }
 
 async function isDiscordAdmin(
@@ -699,8 +713,10 @@ async function handleSlashCommand(
   if (cmd === 'set-channel') {
     const channel = interaction.options.getChannel('channel', true);
     const komik = interaction.options.getString('komik');
+    const channelLabel = 'name' in channel && typeof channel.name === 'string' ? channel.name : channel.id;
+    const isNonComic = isNonComicChannel(channel.id, channelLabel);
     let projectId: string | null = null;
-    if (komik) {
+    if (komik && !isNonComic) {
       const p = await db
         .select({ id: projects.id })
         .from(projects)
@@ -713,13 +729,18 @@ async function handleSlashCommand(
       .values({
         guildId: guildRow.id,
         discordChannelId: channel.id,
-        channelName: `#${channel.name || channel.id}`,
-        projectId,
+        channelName: `#${channelLabel}`,
+        projectId: isNonComic ? null : projectId,
         isReportChannel: true,
-        isDefault: Boolean(projectId),
+        isDefault: isNonComic ? false : Boolean(projectId),
       })
       .onConflictDoNothing();
-    await interaction.reply({ content: `Channel <#${channel.id}> terdaftar sebagai channel laporan.`, ephemeral: true });
+    await interaction.reply({
+      content: isNonComic
+        ? `Channel <#${channel.id}> terdaftar sebagai channel penampungan laporan multi-komik (tidak diikat ke satu proyek komik).`
+        : `Channel <#${channel.id}> terdaftar sebagai channel laporan.`,
+      ephemeral: true,
+    });
     return;
   }
 
@@ -951,6 +972,8 @@ export async function startDiscordBotIfConfigured(db: AppDb): Promise<void> {
             projectTitle: res.projectTitle,
             chapterDisplay: res.chapterDisplay,
             totalChapters: res.totalChapters,
+            isPending: res.isPending,
+            pendingReason: res.pendingReason,
           });
           await message.reply(replyText).catch((err) =>
             console.error('[DiscordBot] Reply error:', err)

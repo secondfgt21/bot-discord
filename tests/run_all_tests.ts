@@ -222,6 +222,7 @@ async function runTests() {
       projectTitle: r.projectTitleMatched ?? r.extractedTitle,
       chapterDisplay: r.chapterDisplay,
       totalChapters: r.chapters.length,
+      isPending: false,
     });
     assert.equal(
       reply,
@@ -230,6 +231,8 @@ async function runTests() {
         'judul : Global Class Change: I Am the Invincible Shadow Monarch',
         'chapter : 08',
         'total chapter : 1',
+        '',
+        'Laporan kamu : sukses tercatat',
       ].join('\n')
     );
   });
@@ -292,6 +295,7 @@ async function runTests() {
       projectTitle: rTag.projectTitleMatched ?? rTag.extractedTitle,
       chapterDisplay: rTag.chapterDisplay,
       totalChapters: rTag.chapters.length,
+      isPending: false,
     });
     assert.equal(
       reply,
@@ -300,6 +304,8 @@ async function runTests() {
         'judul : Solo Leveling',
         'chapter : 4-5',
         'total chapter : 2',
+        '',
+        'Laporan kamu : sukses tercatat',
       ].join('\n')
     );
   });
@@ -316,6 +322,66 @@ async function runTests() {
     assert.equal(r.parseStatus, 'AMBIGUOUS_PROJECT');
     assert.equal(r.projectId, null);
     assert.equal(r.extractedTitle, null);
+  });
+
+  await test('13e. New comic title ("After The School Belle Dumped Me I Became A Martial Arts God") has NO admin review flag', () => {
+    const r = parseDiscordReport(
+      '<#1352988212079104031> After The School Belle Dumped Me I Became A Martial Arts God CH 12 ETL Done <@687369494250782803>',
+      {
+        projects: testProjects,
+        channelMappings: slChannel, // Even if a stale mapping were passed
+        roleAliases: testRoleAliases,
+        mentionedChannels: [{ id: '1352988212079104031', name: 'file-tl' }],
+        currentChannelId: '1352988212079104031',
+        currentChannelName: 'file-tl',
+      }
+    );
+    assert.equal(r.parseStatus, 'VALID');
+    assert.equal(r.extractedTitle, 'After The School Belle Dumped Me I Became A Martial Arts God');
+    assert.equal(r.chapterDisplay, '12');
+    assert.equal(r.chapters.length, 1);
+    assert.equal(r.parseNotes.length, 0);
+
+    // Even in a mapped channel, an unregistered comic title must NOT raise "perlu pemeriksaan admin"
+    const rNewInMapped = parseDiscordReport(
+      'After The School Belle Dumped Me I Became A Martial Arts God CH 12 ETL Done',
+      {
+        projects: testProjects,
+        channelMappings: slChannel,
+        roleAliases: testRoleAliases,
+      }
+    );
+    assert.equal(rNewInMapped.parseStatus, 'VALID');
+    assert.equal(rNewInMapped.projectId, null);
+    assert.equal(
+      rNewInMapped.extractedTitle,
+      'After The School Belle Dumped Me I Became A Martial Arts God'
+    );
+    assert.equal(rNewInMapped.parseNotes.length, 0);
+  });
+
+  await test('13f. #file-tl (1352988212079104031) with existing comic ("Prabowo 3 Periode") never raises Konflik komik', () => {
+    const projectsWithPrabowo = [
+      ...testProjects,
+      { id: 'p-p3p', title: 'Prabowo 3 Periode', aliases: ['Prabowo 3 Periode'] },
+    ];
+    const r = parseDiscordReport(
+      '<#1352988212079104031> Prabowo 3 Periode CH 4-5 ETL Done <@687369494250782803>',
+      {
+        projects: projectsWithPrabowo,
+        channelMappings: slChannel, // Even if stale single-project mapping existed
+        roleAliases: testRoleAliases,
+        mentionedChannels: [{ id: '1352988212079104031', name: 'file-tl' }],
+        currentChannelId: '1352988212079104031',
+        currentChannelName: 'file-tl',
+      }
+    );
+    assert.equal(r.parseStatus, 'VALID');
+    assert.equal(r.projectId, 'p-p3p');
+    assert.equal(r.projectTitleMatched, 'Prabowo 3 Periode');
+    assert.equal(r.chapterDisplay, '4-5');
+    assert.deepEqual(r.chapters, [4, 5]);
+    assert.equal(r.parseNotes.length, 0);
   });
 
   // =========================================================================
@@ -677,10 +743,12 @@ async function runTests() {
         projectTitle: resFileTl.projectTitle,
         chapterDisplay: resFileTl.chapterDisplay,
         totalChapters: resFileTl.totalChapters,
+        isPending: resFileTl.isPending,
+        pendingReason: resFileTl.pendingReason,
       });
       assert.equal(
         reply1,
-        '<@687369494250782803> Laporan Diterima\njudul : Global Class Change: I Am the Invincible Shadow Monarch\nchapter : 08\ntotal chapter : 1'
+        '<@687369494250782803> Laporan Diterima\njudul : Global Class Change: I Am the Invincible Shadow Monarch\nchapter : 08\ntotal chapter : 1\n\nLaporan kamu : sukses tercatat'
       );
 
       const reply2 = formatReportAcceptedMessage({
@@ -688,10 +756,183 @@ async function runTests() {
         projectTitle: resSecondInFileTl.projectTitle,
         chapterDisplay: resSecondInFileTl.chapterDisplay,
         totalChapters: resSecondInFileTl.totalChapters,
+        isPending: resSecondInFileTl.isPending,
+        pendingReason: resSecondInFileTl.pendingReason,
       });
       assert.equal(
         reply2,
-        '<@687369494250782803> Laporan Diterima\njudul : Solo Leveling\nchapter : 4-5\ntotal chapter : 2'
+        '<@687369494250782803> Laporan Diterima\njudul : Solo Leveling\nchapter : 4-5\ntotal chapter : 2\n\nLaporan kamu : sukses tercatat'
+      );
+    });
+
+    await test('19. Auto-register new comic ("After The School Belle...") & auto-detach stale #file-tl mapping ("Prabowo 3 Periode")', async () => {
+      const fileTlChannelId = '1352988212079104031';
+
+      // Simulate a stale legacy DB state where #file-tl was erroneously mapped to Solo Leveling
+      await db
+        .update(channelMappings)
+        .set({ projectId: slProj.id, isDefault: true })
+        .where(eq(channelMappings.discordChannelId, fileTlChannelId));
+
+      // 1) Report with brand-new comic title in #file-tl -> auto-registers into projects + project_aliases, auto-approved, zero admin-review flag
+      const resNewComic = await processDiscordReport(db, {
+        discordMessageId: '900000000000000201',
+        discordGuildId: guild.discordGuildId,
+        discordChannelId: fileTlChannelId,
+        discordChannelName: 'file-tl',
+        discordAuthorId: '687369494250782803',
+        authorUsername: 'pelapor_tl',
+        authorDisplayName: 'Pelapor TL',
+        content:
+          '<#1352988212079104031> After The School Belle Dumped Me I Became A Martial Arts God CH 01, ETL Done <@687369494250782803>',
+        mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
+      });
+      assert.equal(resNewComic.outcome, 'PROCESSED');
+      assert.equal(resNewComic.parseStatus, 'VALID');
+      assert.equal(
+        resNewComic.projectTitle,
+        'After The School Belle Dumped Me I Became A Martial Arts God'
+      );
+      assert.equal(resNewComic.chapterDisplay, '01');
+      assert.equal(resNewComic.totalChapters, 1);
+      assert.equal(resNewComic.approvalSummary, '1 chapter auto-approved');
+
+      // Confirm new comic exists in projects table and #file-tl has been detached (projectId === null)
+      const [createdProj] = await db
+        .select()
+        .from(projects)
+        .where(eq(projects.slug, 'after-the-school-belle-dumped-me-i-became-a-martial-arts-god'))
+        .limit(1);
+      assert.ok(createdProj, 'New comic should be auto-inserted into projects');
+
+      const [fileTlMapping] = await db
+        .select()
+        .from(channelMappings)
+        .where(eq(channelMappings.discordChannelId, fileTlChannelId))
+        .limit(1);
+      assert.equal(fileTlMapping.projectId, null, '#file-tl must not be bound to any single project');
+      assert.equal(fileTlMapping.isDefault, false);
+
+      // 2) Report "Prabowo 3 Periode" in #file-tl -> auto-registered, zero conflict
+      const resPrabowo = await processDiscordReport(db, {
+        discordMessageId: '900000000000000202',
+        discordGuildId: guild.discordGuildId,
+        discordChannelId: fileTlChannelId,
+        discordChannelName: 'file-tl',
+        discordAuthorId: '687369494250782803',
+        authorUsername: 'pelapor_tl',
+        authorDisplayName: 'Pelapor TL',
+        content:
+          '<#1352988212079104031> Prabowo 3 Periode CH 4-5 ETL Done <@687369494250782803>',
+        mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
+      });
+      assert.equal(resPrabowo.outcome, 'PROCESSED');
+      assert.equal(resPrabowo.parseStatus, 'VALID');
+      assert.equal(resPrabowo.projectTitle, 'Prabowo 3 Periode');
+      assert.equal(resPrabowo.chapterDisplay, '4-5');
+      assert.equal(resPrabowo.totalChapters, 2);
+      assert.equal(resPrabowo.approvalSummary, '2 chapter auto-approved');
+
+      // 3) Second report for already-registered "Prabowo 3 Periode" in #file-tl -> matches existing project with zero conflict
+      const resPrabowo2 = await processDiscordReport(db, {
+        discordMessageId: '900000000000000203',
+        discordGuildId: guild.discordGuildId,
+        discordChannelId: fileTlChannelId,
+        discordChannelName: 'file-tl',
+        discordAuthorId: '687369494250782803',
+        authorUsername: 'pelapor_tl',
+        authorDisplayName: 'Pelapor TL',
+        content:
+          '<#1352988212079104031> Prabowo 3 Periode CH 06 ETL Done <@687369494250782803>',
+        mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
+      });
+      assert.equal(resPrabowo2.outcome, 'PROCESSED');
+      assert.equal(resPrabowo2.parseStatus, 'VALID');
+      assert.equal(resPrabowo2.projectTitle, 'Prabowo 3 Periode');
+      assert.equal(resPrabowo2.chapterDisplay, '06');
+      assert.equal(resPrabowo2.totalChapters, 1);
+      assert.equal(resPrabowo2.approvalSummary, '1 chapter auto-approved');
+      assert.equal(resPrabowo2.isPending, false);
+      assert.equal(resPrabowo2.pendingReason, null);
+    });
+
+    await test('20. Pending report notification format includes "Laporan Kamu : Pending" + "pesan : <alasan>"', async () => {
+      const fileTlChannelId = '1352988212079104031';
+
+      // Case A: Duplicate chapter triggers pending with explicit duplicate reason
+      const resDup = await processDiscordReport(db, {
+        discordMessageId: '900000000000000301',
+        discordGuildId: guild.discordGuildId,
+        discordChannelId: fileTlChannelId,
+        discordChannelName: 'file-tl',
+        discordAuthorId: '687369494250782803',
+        authorUsername: 'pelapor_tl',
+        authorDisplayName: 'Pelapor TL',
+        content:
+          '<#1352988212079104031> Prabowo 3 Periode CH 06 ETL Done <@687369494250782803>',
+        mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
+      });
+      assert.equal(resDup.outcome, 'PROCESSED');
+      assert.equal(resDup.isPending, true);
+      assert.equal(resDup.approvalStatus, 'pending');
+      assert.ok(resDup.pendingReason?.includes('Ch. 6'));
+
+      const dupReply = formatReportAcceptedMessage({
+        discordAuthorId: '687369494250782803',
+        projectTitle: resDup.projectTitle,
+        chapterDisplay: resDup.chapterDisplay,
+        totalChapters: resDup.totalChapters,
+        isPending: resDup.isPending,
+        pendingReason: resDup.pendingReason,
+      });
+      assert.equal(
+        dupReply,
+        [
+          '<@687369494250782803> Laporan Diterima',
+          'judul : Prabowo 3 Periode',
+          'chapter : 06',
+          'total chapter : 1',
+          '',
+          'Laporan Kamu : Pending',
+          'pesan : Chapter duplikat terdeteksi (Ch. 6) sudah pernah dilaporkan sebelumnya.',
+        ].join('\n')
+      );
+
+      // Case B: Unknown role triggers pending with role validation reason
+      const resUnknownRole = await processDiscordReport(db, {
+        discordMessageId: '900000000000000302',
+        discordGuildId: guild.discordGuildId,
+        discordChannelId: fileTlChannelId,
+        discordChannelName: 'file-tl',
+        discordAuthorId: '687369494250782803',
+        authorUsername: 'pelapor_tl',
+        authorDisplayName: 'Pelapor TL',
+        content: '<#1352988212079104031> Prabowo 3 Periode CH 07 Typesetter Done',
+        mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
+      });
+      assert.equal(resUnknownRole.outcome, 'PROCESSED');
+      assert.equal(resUnknownRole.isPending, true);
+      assert.equal(resUnknownRole.approvalStatus, 'pending');
+
+      const unknownRoleReply = formatReportAcceptedMessage({
+        discordAuthorId: '687369494250782803',
+        projectTitle: resUnknownRole.projectTitle,
+        chapterDisplay: resUnknownRole.chapterDisplay,
+        totalChapters: resUnknownRole.totalChapters,
+        isPending: resUnknownRole.isPending,
+        pendingReason: resUnknownRole.pendingReason,
+      });
+      assert.equal(
+        unknownRoleReply,
+        [
+          '<@687369494250782803> Laporan Diterima',
+          'judul : Prabowo 3 Periode',
+          'chapter : 07',
+          'total chapter : 1',
+          '',
+          'Laporan Kamu : Pending',
+          'pesan : Role pekerjaan (ETL/Translator, TS/Editor, atau Solo) tidak dikenali.',
+        ].join('\n')
       );
     });
 

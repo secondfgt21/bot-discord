@@ -128,7 +128,11 @@ export function sanitizeTitleText(raw: string): string {
     .replace(/<#\d+>/g, ' ')
     .replace(/<@[!&]?\d+>|@[A-Za-z0-9_.-]+/g, ' ')
     .replace(
-      /(?:,\s*|\s+[-–—]\s+|\s+)(?:(?:etl|ts|tl|translator|editor|solo)\s+)?(?:done|completed|complete|finish|finished|selesai)\b.*$/i,
+      /(?:,\s*|\s+[-–—]\s+)(?:(?:etl|ts|tl|translator|editor|solo)\s+)?(?:done|completed|complete|finish|finished|selesai)\s*$/i,
+      ''
+    )
+    .replace(
+      /\s+(?:etl|ts|tl|translator|editor|solo)\s+(?:done|completed|complete|finish|finished|selesai)\s*$/i,
       ''
     )
     .replace(/\s+/g, ' ')
@@ -530,10 +534,26 @@ export function parseDiscordReport(
   const cleanBeforeChapter = sanitizeTitleText(beforeChapterText);
   const comicTags = tags.filter((tag) => !isNonComicChannel(undefined, tag));
 
-  const mappedProjectIds = options.channelMappings.map((m) => m.projectId);
+  // Channel #file-tl (1352988212079104031) and other shared non-comic channels
+  // are multi-comic intake channels and must NEVER enforce a single-project mapping.
+  const isNonComicCurrentChannel = isNonComicChannel(
+    options.currentChannelId,
+    options.currentChannelName
+  );
+  const mentionsNonComicChannel = mentionedChannelIds.some((id) =>
+    NON_COMIC_CHANNEL_IDS.has(id)
+  );
+  const ignoreCurrentChannelMapping =
+    isNonComicCurrentChannel || mentionsNonComicChannel;
+
+  const effectiveChannelMappings = ignoreCurrentChannelMapping
+    ? []
+    : options.channelMappings;
+
+  const mappedProjectIds = effectiveChannelMappings.map((m) => m.projectId);
   const defaultMapping =
-    options.channelMappings.find((m) => m.isDefault) ??
-    (options.channelMappings.length === 1 ? options.channelMappings[0] : null);
+    effectiveChannelMappings.find((m) => m.isDefault) ??
+    (effectiveChannelMappings.length === 1 ? effectiveChannelMappings[0] : null);
 
   let resolvedProjectId: string | null = null;
   let projectTitleMatched: string | null = null;
@@ -545,7 +565,11 @@ export function parseDiscordReport(
     resolvedProjectId = project.id;
     projectTitleMatched = project.title;
     extractedTitle = project.title;
-    if (mappedProjectIds.length > 0 && !mappedProjectIds.includes(project.id)) {
+    if (
+      !ignoreCurrentChannelMapping &&
+      mappedProjectIds.length > 0 &&
+      !mappedProjectIds.includes(project.id)
+    ) {
       hasConflict = true;
       notes.push(
         `Konflik komik: pesan menyebut "${project.title}", sedangkan channel ini ter-mapping ke proyek lain.`
@@ -553,18 +577,11 @@ export function parseDiscordReport(
     }
   };
 
-  const applyUnmatchedTitle = (titleCandidate: string) => {
+  // New/unregistered comic titles are accepted cleanly for auto-registration in DB
+  // without flagging admin review or project-channel conflict.
+  const applyNewComicTitle = (titleCandidate: string) => {
     extractedTitle = titleCandidate;
-    if (defaultMapping && mappedProjectIds.length === 1) {
-      resolvedProjectId = defaultMapping.projectId;
-      hasConflict = true;
-      notes.push(
-        `Nama komik "${titleCandidate}" tidak dikenal pada daftar komik, perlu pemeriksaan admin.`
-      );
-    } else {
-      isAmbiguousProject = true;
-      notes.push(`Komik "${titleCandidate}" tidak ditemukan di database.`);
-    }
+    projectTitleMatched = titleCandidate;
   };
 
   // Priority 1: Explicit comic title written before chapter (e.g. after <#1352988212079104031>)
@@ -573,7 +590,7 @@ export function parseDiscordReport(
     if (matched) {
       applyMatchedProject(matched);
     } else {
-      applyUnmatchedTitle(cleanBeforeChapter);
+      applyNewComicTitle(cleanBeforeChapter);
     }
   } else if (comicTags.length > 0) {
     // Priority 2: Leading comic hashtag like #Solo-Leveling (excluding #file-tl etc.)
@@ -590,7 +607,7 @@ export function parseDiscordReport(
       applyMatchedProject(matchedFromTag);
     } else {
       const normalizedTagTitle = normalizeChannelNameToTitle(comicTags[0]);
-      applyUnmatchedTitle(normalizedTagTitle);
+      applyNewComicTitle(normalizedTagTitle);
     }
   } else {
     // Priority 3: Mentioned Discord comic channel <#channel_id> (excluding #file-tl / non-comic channels)
@@ -636,7 +653,7 @@ export function parseDiscordReport(
           if (matched) {
             applyMatchedProject(matched);
           } else {
-            applyUnmatchedTitle(normalizedChTitle);
+            applyNewComicTitle(normalizedChTitle);
           }
           resolvedFromMentionedChannel = true;
           break;
@@ -658,7 +675,7 @@ export function parseDiscordReport(
         );
       } else if (
         options.currentChannelName &&
-        !isNonComicChannel(options.currentChannelId, options.currentChannelName)
+        !isNonComicCurrentChannel
       ) {
         const normalizedCurrentTitle = normalizeChannelNameToTitle(options.currentChannelName);
         if (normalizedCurrentTitle) {
@@ -668,9 +685,7 @@ export function parseDiscordReport(
             projectTitleMatched = matched.title;
             extractedTitle = matched.title;
           } else {
-            extractedTitle = normalizedCurrentTitle;
-            isAmbiguousProject = true;
-            notes.push(`Komik "${normalizedCurrentTitle}" belum terdaftar di database.`);
+            applyNewComicTitle(normalizedCurrentTitle);
           }
         } else {
           isAmbiguousProject = true;
@@ -690,7 +705,7 @@ export function parseDiscordReport(
     parseStatus = 'UNKNOWN_ROLE';
   } else if (hasConflict) {
     parseStatus = 'PROJECT_CHANNEL_CONFLICT';
-  } else if (isAmbiguousProject || !resolvedProjectId) {
+  } else if (isAmbiguousProject || (!resolvedProjectId && !extractedTitle)) {
     parseStatus = 'AMBIGUOUS_PROJECT';
   } else if (!workStatus) {
     parseStatus = 'UNKNOWN_STATUS';

@@ -6,6 +6,7 @@ import * as XLSX from 'xlsx';
 import { createAuthMiddleware, requireRoles, signAuthToken } from './auth.ts';
 import { getDbMode, seedGuildDefaults, type AppDb } from './db.ts';
 import { getBotRuntimeState, triggerManualSync } from './discordBot.ts';
+import { isNonComicChannel } from './parser.ts';
 import {
   closePayrollPeriod,
   correctReportChapter,
@@ -985,6 +986,14 @@ export function createApiRouter(db: AppDb): Router {
         return;
       }
 
+      if (discordChannelId?.trim() && isNonComicChannel(discordChannelId.trim(), channelName)) {
+        res.status(400).json({
+          error:
+            'Channel penampungan laporan multi-komik (seperti #file-tl / 1352988212079104031) tidak boleh di-mapping ke satu komik tertentu.',
+        });
+        return;
+      }
+
       const slug = title
         .trim()
         .toLowerCase()
@@ -1158,6 +1167,14 @@ export function createApiRouter(db: AppDb): Router {
 
       if (!discordChannelId?.trim() || !/^\d+$/.test(discordChannelId.trim())) {
         res.status(400).json({ error: 'Discord Channel ID valid (angka Snowflake) wajib diisi.' });
+        return;
+      }
+
+      if (isNonComicChannel(discordChannelId.trim(), channelName)) {
+        res.status(400).json({
+          error:
+            'Channel penampungan laporan multi-komik (seperti #file-tl / 1352988212079104031) tidak boleh di-mapping ke satu komik tertentu.',
+        });
         return;
       }
 

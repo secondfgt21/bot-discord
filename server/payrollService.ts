@@ -1,6 +1,7 @@
 import { and, desc, eq, inArray, notInArray, sql } from 'drizzle-orm';
 import { ensurePeriodExists, seedGuildDefaults, type AppDb } from './db.ts';
 import {
+  isNonComicChannel,
   parseDiscordReport,
   type ChannelMappingEntry,
   type GuildChannelMappingEntry,
@@ -149,19 +150,27 @@ async function loadParserCatalog(
   const isReportChannel = channelRows.some((r) => r.isReportChannel);
   const currentChannelName =
     channelRows.find((r) => r.channelName?.trim())?.channelName?.trim() ?? null;
-  const mappedChannels: ChannelMappingEntry[] = channelRows
-    .filter((r) => r.projectId !== null)
-    .map((r) => ({
-      projectId: r.projectId as string,
-      isDefault: r.isDefault,
-    }));
+  const isCurrentNonComic = isNonComicChannel(discordChannelId, currentChannelName);
 
-  const guildChannelMappingsList: GuildChannelMappingEntry[] = allGuildChannelRows.map((r) => ({
-    discordChannelId: r.discordChannelId,
-    channelName: r.channelName,
-    projectId: r.projectId,
-    isDefault: r.isDefault,
-  }));
+  // Never expose single-project mappings for multi-comic intake channels like #file-tl (1352988212079104031)
+  const mappedChannels: ChannelMappingEntry[] = isCurrentNonComic
+    ? []
+    : channelRows
+        .filter((r) => r.projectId !== null)
+        .map((r) => ({
+          projectId: r.projectId as string,
+          isDefault: r.isDefault,
+        }));
+
+  const guildChannelMappingsList: GuildChannelMappingEntry[] = allGuildChannelRows.map((r) => {
+    const nonComic = isNonComicChannel(r.discordChannelId, r.channelName);
+    return {
+      discordChannelId: r.discordChannelId,
+      channelName: r.channelName,
+      projectId: nonComic ? null : r.projectId,
+      isDefault: nonComic ? false : r.isDefault,
+    };
+  });
 
   const projectRows = await db
     .select({ id: projects.id, title: projects.title })
@@ -255,12 +264,22 @@ async function resolveOrCreateAutoProject(
   }
 
   if (targetProject) {
+    await db
+      .insert(projectAliases)
+      .values({
+        guildId,
+        projectId: targetProject.id,
+        alias: targetProject.title,
+      })
+      .onConflictDoNothing();
+
     parsed.projectId = targetProject.id;
     parsed.projectTitleMatched = targetProject.title;
     parsed.extractedTitle = targetProject.title;
     parsed.parseNotes = parsed.parseNotes.filter(
       (n) =>
         !n.includes('tidak ditemukan') &&
+        !n.includes('tidak dikenal') &&
         !n.includes('belum di-mapping') &&
         !n.includes('belum terdaftar') &&
         !n.includes('perlu pemeriksaan')
@@ -514,6 +533,9 @@ export async function processDiscordReport(
   chaptersCreated?: number;
   totalAmountIdr?: number;
   approvalSummary?: string;
+  approvalStatus?: 'approved' | 'pending';
+  isPending?: boolean;
+  pendingReason?: string | null;
 }> {
   if (!/^\d+$/.test(msg.discordMessageId) || !/^\d+$/.test(msg.discordAuthorId) || !/^\d+$/.test(msg.discordChannelId)) {
     throw new Error('Discord Message ID, Channel ID, dan Author ID harus berupa angka Snowflake valid.');
@@ -616,6 +638,7 @@ export async function processDiscordReport(
     let autoApprovedCount = 0;
     let pendingCount = 0;
     let totalAmountIdr = 0;
+    const duplicateChapters: number[] = [];
 
     for (const chNum of chaptersToInsert) {
       let duplicateOfId: string | null = null;
@@ -640,6 +663,7 @@ export async function processDiscordReport(
         if (dupRows.length > 0) {
           duplicateFlag = true;
           duplicateOfId = dupRows[0].id;
+          duplicateChapters.push(chNum);
         }
       }
 
@@ -679,6 +703,26 @@ export async function processDiscordReport(
       });
     }
 
+    const isPending = pendingCount > 0;
+    let pendingReason: string | null = null;
+    if (isPending) {
+      const reasons: string[] = [];
+      for (const note of parsed.parseNotes) {
+        const trimmed = note.trim();
+        if (trimmed && !reasons.includes(trimmed)) {
+          reasons.push(trimmed);
+        }
+      }
+      if (duplicateChapters.length > 0) {
+        const dupList = duplicateChapters.map((c) => `Ch. ${c}`).join(', ');
+        reasons.push(`Chapter duplikat terdeteksi (${dupList}) sudah pernah dilaporkan sebelumnya.`);
+      }
+      pendingReason =
+        reasons.length > 0
+          ? reasons.join(' ')
+          : 'Laporan memerlukan pemeriksaan admin.';
+    }
+
     await txDb.insert(reportEvents).values({
       reportId: createdReport.id,
       eventType: 'CREATED',
@@ -691,20 +735,24 @@ export async function processDiscordReport(
       },
       actorType: 'discord_bot',
       actorId: msg.discordAuthorId,
-      reason: parsed.parseNotes.join('; ') || 'Parsed from Discord message',
+      reason: pendingReason || parsed.parseNotes.join('; ') || 'Parsed from Discord message',
     });
 
     if (!periodIsClosed) {
       await recalculatePayrollForMemberPeriod(txDb, guild.id, period.id, member.id);
     }
 
-    if (pendingCount > 0) {
+    if (isPending) {
       await createNotification(txDb, {
         guildId: guild.id,
         type: 'REPORT_PENDING',
         title: `Laporan Pending Review (${member.displayName})`,
-        message: `${msg.content.slice(0, 120)} — ${parsed.parseNotes.join(' ') || 'Kemungkinan duplikat terdeteksi.'}`,
-        payload: { reportId: createdReport.id, parseStatus: parsed.parseStatus },
+        message: `${msg.content.slice(0, 120)} — ${pendingReason}`,
+        payload: {
+          reportId: createdReport.id,
+          parseStatus: parsed.parseStatus,
+          pendingReason,
+        },
         dedupKey: `report_pending:${msg.discordMessageId}`,
       });
     } else {
@@ -749,10 +797,12 @@ export async function processDiscordReport(
       totalChapters: parsed.chapters.length,
       chaptersCreated: chaptersToInsert.length,
       totalAmountIdr,
-      approvalSummary:
-        pendingCount > 0
-          ? `${pendingCount} chapter pending review`
-          : `${autoApprovedCount} chapter auto-approved`,
+      approvalSummary: isPending
+        ? `${pendingCount} chapter pending review`
+        : `${autoApprovedCount} chapter auto-approved`,
+      approvalStatus: isPending ? ('pending' as const) : ('approved' as const),
+      isPending,
+      pendingReason,
     };
   });
 }

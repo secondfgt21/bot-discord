@@ -1,5 +1,5 @@
 import { PGlite } from '@electric-sql/pglite';
-import { count, eq } from 'drizzle-orm';
+import { and, count, eq, inArray } from 'drizzle-orm';
 import { drizzle as drizzlePg, type NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { migrate as migratePg } from 'drizzle-orm/node-postgres/migrator';
 import { drizzle as drizzlePglite } from 'drizzle-orm/pglite';
@@ -7,6 +7,7 @@ import { migrate as migratePglite } from 'drizzle-orm/pglite/migrator';
 import fs from 'node:fs';
 import path from 'node:path';
 import pg from 'pg';
+import { NON_COMIC_CHANNEL_IDS } from './parser.ts';
 import * as schema from './schema.ts';
 import { getJakartaDateParts } from './time.ts';
 
@@ -158,6 +159,55 @@ export async function seedGuildDefaults(db: AppDb, guildId: string): Promise<voi
       .insert(schema.botSettings)
       .values({ guildId, key: s.key, valueJson: s.valueJson })
       .onConflictDoNothing();
+  }
+
+  // Ensure multi-comic intake channels (such as #file-tl / 1352988212079104031)
+  // are never bound to a single comic project in channel_mappings.
+  const nonComicIds = Array.from(NON_COMIC_CHANNEL_IDS);
+  if (nonComicIds.length > 0) {
+    const staleRows = await db
+      .select({
+        id: schema.channelMappings.id,
+        discordChannelId: schema.channelMappings.discordChannelId,
+        projectId: schema.channelMappings.projectId,
+      })
+      .from(schema.channelMappings)
+      .where(
+        and(
+          eq(schema.channelMappings.guildId, guildId),
+          inArray(schema.channelMappings.discordChannelId, nonComicIds)
+        )
+      );
+
+    const byChannel = new Map<string, typeof staleRows>();
+    for (const row of staleRows) {
+      const list = byChannel.get(row.discordChannelId) ?? [];
+      list.push(row);
+      byChannel.set(row.discordChannelId, list);
+    }
+
+    for (const rows of byChannel.values()) {
+      const unmappedRow = rows.find((r) => r.projectId === null);
+      const mappedRows = rows.filter((r) => r.projectId !== null);
+      if (mappedRows.length === 0) continue;
+
+      if (unmappedRow) {
+        await db
+          .delete(schema.channelMappings)
+          .where(inArray(schema.channelMappings.id, mappedRows.map((r) => r.id)));
+      } else {
+        const [first, ...rest] = mappedRows;
+        await db
+          .update(schema.channelMappings)
+          .set({ projectId: null, isDefault: false, isReportChannel: true })
+          .where(eq(schema.channelMappings.id, first.id));
+        if (rest.length > 0) {
+          await db
+            .delete(schema.channelMappings)
+            .where(inArray(schema.channelMappings.id, rest.map((r) => r.id)));
+        }
+      }
+    }
   }
 
   const jakarta = getJakartaDateParts();
