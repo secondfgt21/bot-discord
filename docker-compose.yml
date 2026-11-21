@@ -1,0 +1,21 @@
+services:
+  comicpay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: comicpay-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+    ports:
+      - "127.0.0.1:3000:3000"
+    mem_limit: 1536m
+    cpus: "1.5"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

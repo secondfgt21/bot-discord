@@ -1,0 +1,6 @@
+{
+  "name": "ComicPay — Discord Payroll Management System",
+  "description": "Automated Discord comic translation and editing payroll system with deterministic smart report parsing, hybrid approval workflow, monthly Asia/Jakarta payroll periods, multi-payment tracking, and audit logging.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

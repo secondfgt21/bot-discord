@@ -1,0 +1,21 @@
+[Unit]
+Description=ComicPay Unified Node.js Payroll Server & Discord Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/comicpay
+Environment=NODE_ENV=production
+EnvironmentFile=/opt/comicpay/.env
+ExecStart=/usr/bin/npm run start
+Restart=always
+RestartSec=5
+MemoryMax=1500M
+CPUQuota=150%
+StandardOutput=append:/var/log/comicpay/app.log
+StandardError=append:/var/log/comicpay/error.log
+
+[Install]
+WantedBy=multi-user.target
