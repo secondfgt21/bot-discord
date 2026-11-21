@@ -528,7 +528,7 @@ async function runTests() {
       assert.equal(pr.totalChapters, 9);
       assert.equal(pr.netAmountIdr, 36000);
 
-      // Cross-message duplicate detection
+      // Cross-message duplicate detection (immediately rejected without blocking payroll)
       const dupRes = await processDiscordReport(db, {
         discordMessageId: '900000000000000004',
         discordGuildId: guild.discordGuildId,
@@ -539,6 +539,9 @@ async function runTests() {
         content: 'CH 501 ETL Done @Controller',
       });
       assert.equal(dupRes.outcome, 'PROCESSED');
+      assert.equal(dupRes.approvalStatus, 'rejected');
+      assert.equal(dupRes.isRejected, true);
+      assert.equal(dupRes.isPending, false);
       assert.equal(dupRes.totalAmountIdr, 0);
 
       // Partial, Full, and Reversal payment
@@ -568,19 +571,21 @@ async function runTests() {
       assert.equal(prAfterRev.remainingAmountIdr, 26000);
       assert.equal(prAfterRev.paymentStatus, 'PARTIALLY_PAID');
 
-      // Reject pending duplicate chapter so period can close cleanly
+      // Ensure no pending chapters block closing period
       const pendingCh = await db
         .select({ id: reportChapters.id })
         .from(reportChapters)
         .where(eq(reportChapters.approvalStatus, 'pending'));
 
-      await updateChapterApproval(
-        db,
-        pendingCh.map((c) => c.id),
-        'reject',
-        adminActor,
-        'Duplikat terkonfirmasi'
-      );
+      if (pendingCh.length > 0) {
+        await updateChapterApproval(
+          db,
+          pendingCh.map((c) => c.id),
+          'reject',
+          adminActor,
+          'Duplikat terkonfirmasi'
+        );
+      }
     });
 
     await test('16. Message Edit Sync & Soft Delete Void', async () => {
@@ -856,10 +861,10 @@ async function runTests() {
       assert.equal(resPrabowo2.pendingReason, null);
     });
 
-    await test('20. Pending report notification format includes "Laporan Kamu : Pending" + "pesan : <alasan>"', async () => {
+    await test('20. Notification format for All-Duplicate Rejection & Non-Duplicate Pending ("Laporan Kamu : Pending" + "pesan :")', async () => {
       const fileTlChannelId = '1352988212079104031';
 
-      // Case A: Duplicate chapter triggers pending with explicit duplicate reason
+      // Case A: Single already-reported chapter is rejected directly (not pending) and tags previous reporter
       const resDup = await processDiscordReport(db, {
         discordMessageId: '900000000000000301',
         discordGuildId: guild.discordGuildId,
@@ -873,9 +878,15 @@ async function runTests() {
         mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
       });
       assert.equal(resDup.outcome, 'PROCESSED');
-      assert.equal(resDup.isPending, true);
-      assert.equal(resDup.approvalStatus, 'pending');
-      assert.ok(resDup.pendingReason?.includes('Ch. 6'));
+      assert.equal(resDup.isPending, false);
+      assert.equal(resDup.isRejected, true);
+      assert.equal(resDup.approvalStatus, 'rejected');
+      assert.deepEqual(resDup.acceptedChapters, []);
+      assert.equal(resDup.rejectedDuplicates?.length, 1);
+      assert.equal(resDup.rejectedDuplicates?.[0].chapterNumber, 6);
+      assert.equal(resDup.rejectedDuplicates?.[0].previousReporterDiscordId, '687369494250782803');
+      assert.equal(resDup.chapterDisplay, '-');
+      assert.equal(resDup.totalChapters, 0);
 
       const dupReply = formatReportAcceptedMessage({
         discordAuthorId: '687369494250782803',
@@ -883,22 +894,25 @@ async function runTests() {
         chapterDisplay: resDup.chapterDisplay,
         totalChapters: resDup.totalChapters,
         isPending: resDup.isPending,
+        isRejected: resDup.isRejected,
         pendingReason: resDup.pendingReason,
+        acceptedChapters: resDup.acceptedChapters,
+        rejectedDuplicates: resDup.rejectedDuplicates,
       });
       assert.equal(
         dupReply,
         [
-          '<@687369494250782803> Laporan Diterima',
-          'judul : Prabowo 3 Periode',
-          'chapter : 06',
-          'total chapter : 1',
+          '<@687369494250782803> Laporan Ditolak',
+          'Judul : Prabowo 3 Periode',
+          'Chapter : -',
+          'total chapter : 0',
           '',
-          'Laporan Kamu : Pending',
-          'pesan : Chapter duplikat untuk komik "Prabowo 3 Periode" (Role: Translator) pada Ch. 6 — sudah tercatat sebelumnya oleh Pelapor TL (Status: Disetujui).',
+          'Laporan kamu ditolak',
+          'pesan : chapter 6 pernah dilapor sebelumnya oleh <@687369494250782803>, tidak ada chapter baru yang tercatat, jika itu dilapor bukan olehmu, parani orang tersebut, saya sudah tag orang yang melapor chapter 6',
         ].join('\n')
       );
 
-      // Case B: Unknown role triggers pending with role validation reason
+      // Case B: Unknown role still triggers pending with exact "Laporan Kamu : Pending" format
       const resUnknownRole = await processDiscordReport(db, {
         discordMessageId: '900000000000000302',
         discordGuildId: guild.discordGuildId,
@@ -920,7 +934,10 @@ async function runTests() {
         chapterDisplay: resUnknownRole.chapterDisplay,
         totalChapters: resUnknownRole.totalChapters,
         isPending: resUnknownRole.isPending,
+        isRejected: resUnknownRole.isRejected,
         pendingReason: resUnknownRole.pendingReason,
+        acceptedChapters: resUnknownRole.acceptedChapters,
+        rejectedDuplicates: resUnknownRole.rejectedDuplicates,
       });
       assert.equal(
         unknownRoleReply,
@@ -936,120 +953,163 @@ async function runTests() {
       );
     });
 
-    await test('21. Smart Duplicate Logic Matrix (Cross-Reporter, Range Overlap, Different Role, Different Chapter, Edit & Delete)', async () => {
+    await test('21. Split Chapter Range Duplicate Rejection, Exact Notification Format, Role Rules, Edit & Delete Sync', async () => {
       const fileTlChannelId = '1352988212079104031';
+      const prevReporterId = '111222333444555666';
+      const currReporterId = '687369494250782803';
 
-      // Baseline: Worker A reports "Nano Machine" Ch 4 as Translator (ETL) -> APPROVED
-      const baseRes = await processDiscordReport(db, {
+      // Baseline: Previous reporter submits Solo Leveling CH 15 ETL Done -> APPROVED
+      const baseSlRes = await processDiscordReport(db, {
         discordMessageId: '900000000000000401',
         discordGuildId: guild.discordGuildId,
         discordChannelId: fileTlChannelId,
         discordChannelName: 'file-tl',
-        discordAuthorId: '770000000000000701',
-        authorUsername: 'worker_a',
-        authorDisplayName: 'Worker A',
-        content: '<#1352988212079104031> Nano Machine CH 04 ETL Done',
-        mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
+        discordAuthorId: prevReporterId,
+        authorUsername: 'pelapor_awal',
+        authorDisplayName: 'Pelapor Awal',
+        content: '#files-tl Solo Leveling CH 15 ETL Done',
       });
-      assert.equal(baseRes.outcome, 'PROCESSED');
-      assert.equal(baseRes.isPending, false);
-      assert.equal(baseRes.approvalStatus, 'approved');
+      assert.equal(baseSlRes.outcome, 'PROCESSED');
+      assert.equal(baseSlRes.isPending, false);
+      assert.equal(baseSlRes.approvalStatus, 'approved');
+      assert.equal(baseSlRes.projectTitle, 'Solo Leveling');
+      assert.deepEqual(baseSlRes.acceptedChapters, [15]);
 
-      // Case 1: Same comic + Same role + Same chapter by DIFFERENT reporter (Worker B) -> PENDING
-      const crossUserDup = await processDiscordReport(db, {
+      // Snapshot current reporter's payroll chapters BEFORE reporting 14-16
+      const [currMemberBefore] = await db
+        .select()
+        .from(members)
+        .where(eq(members.discordUserId, currReporterId))
+        .limit(1);
+      const [prBefore] = await db
+        .select()
+        .from(payrollRecords)
+        .where(eq(payrollRecords.memberId, currMemberBefore.id))
+        .limit(1);
+      const chaptersBefore = prBefore.totalChapters;
+      const netBefore = prBefore.netAmountIdr;
+
+      // Case 1 (Exact User Scenario): Current reporter reports "#files-tl Solo Leveling CH 14-16 ETL Done"
+      // Ch 14 & 16 must be auto_approved; Ch 15 must be rejected (duplicate of 111222333444555666)
+      const splitRes = await processDiscordReport(db, {
         discordMessageId: '900000000000000402',
         discordGuildId: guild.discordGuildId,
         discordChannelId: fileTlChannelId,
         discordChannelName: 'file-tl',
-        discordAuthorId: '770000000000000702',
-        authorUsername: 'worker_b',
-        authorDisplayName: 'Worker B',
-        content: '<#1352988212079104031> nano-machine CH 4 TL Done',
-        mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
+        discordAuthorId: currReporterId,
+        authorUsername: 'pelapor_tl',
+        authorDisplayName: 'Pelapor TL',
+        content: '#files-tl Solo Leveling CH 14-16 ETL Done',
       });
-      assert.equal(crossUserDup.outcome, 'PROCESSED');
-      assert.equal(crossUserDup.isPending, true);
-      assert.equal(crossUserDup.approvalStatus, 'pending');
-      assert.equal(crossUserDup.totalAmountIdr, 0);
-      assert.ok(crossUserDup.pendingReason?.includes('Nano Machine'));
-      assert.ok(crossUserDup.pendingReason?.includes('Translator'));
-      assert.ok(crossUserDup.pendingReason?.includes('Ch. 4'));
-      assert.ok(crossUserDup.pendingReason?.includes('Worker A'));
+      assert.equal(splitRes.outcome, 'PROCESSED');
+      assert.equal(splitRes.isPending, false);
+      assert.equal(splitRes.isRejected, false);
+      assert.equal(splitRes.approvalStatus, 'approved');
+      assert.equal(splitRes.projectTitle, 'Solo Leveling');
+      assert.deepEqual(splitRes.acceptedChapters, [14, 16]);
+      assert.equal(splitRes.chapterDisplay, '14&16');
+      assert.equal(splitRes.totalChapters, 2);
+      assert.equal(splitRes.totalAmountIdr, 9000); // 2 accepted chapters * Rp4.500
+      assert.equal(splitRes.rejectedDuplicates?.length, 1);
+      assert.equal(splitRes.rejectedDuplicates?.[0].chapterNumber, 15);
+      assert.equal(splitRes.rejectedDuplicates?.[0].previousReporterDiscordId, prevReporterId);
 
-      // Case 2: Same comic + Same role + OVERLAPPING RANGE (CH 4-5 where 4 is taken, 5 is free) -> PENDING
-      const rangeOverlap = await processDiscordReport(db, {
+      // Verify DB chapter rows individually
+      const splitDbChapters = await db
+        .select()
+        .from(reportChapters)
+        .where(eq(reportChapters.reportId, splitRes.reportId!));
+      const ch14 = splitDbChapters.find((c) => c.chapterNumber === 14);
+      const ch15 = splitDbChapters.find((c) => c.chapterNumber === 15);
+      const ch16 = splitDbChapters.find((c) => c.chapterNumber === 16);
+      assert.equal(ch14?.approvalStatus, 'auto_approved');
+      assert.equal(ch14?.duplicateFlag, false);
+      assert.equal(ch14?.amountIdr, 4500);
+      assert.equal(ch15?.approvalStatus, 'rejected');
+      assert.equal(ch15?.duplicateFlag, true);
+      assert.equal(ch15?.amountIdr, 0);
+      assert.equal(ch16?.approvalStatus, 'auto_approved');
+      assert.equal(ch16?.duplicateFlag, false);
+      assert.equal(ch16?.amountIdr, 4500);
+
+      // Verify payroll only incremented by +2 chapters and +Rp9.000 (Ch 15 NOT double-counted)
+      const [prAfterSplit] = await db
+        .select()
+        .from(payrollRecords)
+        .where(eq(payrollRecords.memberId, currMemberBefore.id))
+        .limit(1);
+      assert.equal(prAfterSplit.totalChapters, chaptersBefore + 2);
+      assert.equal(prAfterSplit.netAmountIdr, netBefore + 9000);
+
+      // Verify EXACT Discord notification format character-for-character
+      const splitReply = formatReportAcceptedMessage({
+        discordAuthorId: currReporterId,
+        projectTitle: splitRes.projectTitle,
+        chapterDisplay: splitRes.chapterDisplay,
+        totalChapters: splitRes.totalChapters,
+        isPending: splitRes.isPending,
+        isRejected: splitRes.isRejected,
+        pendingReason: splitRes.pendingReason,
+        acceptedChapters: splitRes.acceptedChapters,
+        rejectedDuplicates: splitRes.rejectedDuplicates,
+      });
+      assert.equal(
+        splitReply,
+        [
+          '<@687369494250782803> Laporan Diterima',
+          'Judul : Solo Leveling',
+          'Chapter : 14&16',
+          'total chapter : 2',
+          '',
+          'Laporan kamu sukses tercatat',
+          'pesan : chapter 15 pernah dilapor sebelumnya oleh <@111222333444555666>, laporan yang tercatat chapter 14&16, jika itu dilapor bukan olehmu, parani orang tersebut, saya sudah tag orang yang melapor chapter 15',
+        ].join('\n')
+      );
+
+      // Case 2: Same comic + DIFFERENT role (Editor / TS) + Same chapter (CH 15) -> APPROVED cleanly
+      const diffRole = await processDiscordReport(db, {
         discordMessageId: '900000000000000403',
         discordGuildId: guild.discordGuildId,
         discordChannelId: fileTlChannelId,
         discordChannelName: 'file-tl',
-        discordAuthorId: '770000000000000703',
-        authorUsername: 'worker_c',
-        authorDisplayName: 'Worker C',
-        content: '<#1352988212079104031> Nano Machine CH 4-5 ETL Done',
-        mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
-      });
-      assert.equal(rangeOverlap.outcome, 'PROCESSED');
-      assert.equal(rangeOverlap.isPending, true);
-      assert.equal(rangeOverlap.approvalStatus, 'pending');
-      assert.equal(rangeOverlap.totalAmountIdr, 0);
-      assert.ok(rangeOverlap.pendingReason?.includes('Ch. 4'));
-      assert.ok(rangeOverlap.pendingReason?.includes('Worker A'));
-
-      // Reject the pending overlap report so Ch. 5 is NOT blocked by pending record
-      const overlapChapters = await db
-        .select({ id: reportChapters.id })
-        .from(reportChapters)
-        .where(eq(reportChapters.reportId, rangeOverlap.reportId!));
-      await updateChapterApproval(
-        db,
-        overlapChapters.map((c) => c.id),
-        'reject',
-        adminActor,
-        'Overlap ditolak'
-      );
-
-      // Case 3: Same comic + DIFFERENT role (Editor / TS) + Same chapter (CH 4) -> APPROVED
-      const diffRole = await processDiscordReport(db, {
-        discordMessageId: '900000000000000404',
-        discordGuildId: guild.discordGuildId,
-        discordChannelId: fileTlChannelId,
-        discordChannelName: 'file-tl',
         discordAuthorId: '770000000000000702',
         authorUsername: 'worker_b',
         authorDisplayName: 'Worker B',
-        content: '<#1352988212079104031> Nano Machine CH 04 TS Done',
+        content: '<#1352988212079104031> Solo Leveling CH 15 TS Done',
         mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
       });
       assert.equal(diffRole.outcome, 'PROCESSED');
       assert.equal(diffRole.isPending, false);
+      assert.equal(diffRole.isRejected, false);
       assert.equal(diffRole.approvalStatus, 'approved');
+      assert.deepEqual(diffRole.rejectedDuplicates, []);
 
-      // Case 4: Same comic + Same role (Translator) + DIFFERENT chapter (CH 5, after overlap was rejected) -> APPROVED
+      // Case 3: Same comic + Same role (Translator) + DIFFERENT chapter (CH 17) -> APPROVED cleanly
       const diffChapter = await processDiscordReport(db, {
-        discordMessageId: '900000000000000405',
+        discordMessageId: '900000000000000404',
         discordGuildId: guild.discordGuildId,
         discordChannelId: fileTlChannelId,
         discordChannelName: 'file-tl',
         discordAuthorId: '770000000000000703',
         authorUsername: 'worker_c',
         authorDisplayName: 'Worker C',
-        content: '<#1352988212079104031> Nano Machine CH 05 ETL Done',
+        content: '<#1352988212079104031> Solo Leveling CH 17 ETL Done',
         mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
       });
       assert.equal(diffChapter.outcome, 'PROCESSED');
       assert.equal(diffChapter.isPending, false);
       assert.equal(diffChapter.approvalStatus, 'approved');
 
-      // Case 5: Edit own message does NOT block itself, whereas editing to collide with Ch. 4 flags pending
+      // Case 4: Edit own message (17 -> 17-18) does NOT block itself
       const selfEdit = await handleDiscordMessageEdit(db, {
-        discordMessageId: '900000000000000405',
+        discordMessageId: '900000000000000404',
         discordGuildId: guild.discordGuildId,
         discordChannelId: fileTlChannelId,
         discordChannelName: 'file-tl',
         discordAuthorId: '770000000000000703',
         authorUsername: 'worker_c',
         authorDisplayName: 'Worker C',
-        content: '<#1352988212079104031> Nano Machine CH 5-6 ETL Done',
+        content: '<#1352988212079104031> Solo Leveling CH 17-18 ETL Done',
         mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
       });
       assert.equal(selfEdit.status, 'EDITED_SYNCED');
@@ -1065,16 +1125,17 @@ async function runTests() {
       assert.equal(afterSelfEditChapters.length, 2);
       assert.ok(afterSelfEditChapters.every((c) => c.approvalStatus === 'auto_approved'));
 
-      // Edit to collide with Ch. 4 (already reported by Worker A) -> routed to pending with duplicateFlag=true on Ch. 4
+      // Edit to collide with Ch 15 & 16 (already taken) while keeping Ch 17 free:
+      // Ch 15 & 16 become rejected (duplicateFlag=true, amountIdr=0), Ch 17 stays auto_approved!
       await handleDiscordMessageEdit(db, {
-        discordMessageId: '900000000000000405',
+        discordMessageId: '900000000000000404',
         discordGuildId: guild.discordGuildId,
         discordChannelId: fileTlChannelId,
         discordChannelName: 'file-tl',
         discordAuthorId: '770000000000000703',
         authorUsername: 'worker_c',
         authorDisplayName: 'Worker C',
-        content: '<#1352988212079104031> Nano Machine CH 4-5 ETL Done',
+        content: '<#1352988212079104031> Solo Leveling CH 15-17 ETL Done',
         mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
       });
       const afterCollideChapters = await db
@@ -1086,28 +1147,37 @@ async function runTests() {
             notInArray(reportChapters.approvalStatus, ['void'])
           )
         );
-      assert.ok(afterCollideChapters.every((c) => c.approvalStatus === 'pending'));
-      assert.ok(afterCollideChapters.some((c) => c.chapterNumber === 4 && c.duplicateFlag === true));
+      const editCh15 = afterCollideChapters.find((c) => c.chapterNumber === 15);
+      const editCh16 = afterCollideChapters.find((c) => c.chapterNumber === 16);
+      const editCh17 = afterCollideChapters.find((c) => c.chapterNumber === 17);
+      assert.equal(editCh15?.approvalStatus, 'rejected');
+      assert.equal(editCh15?.duplicateFlag, true);
+      assert.equal(editCh15?.amountIdr, 0);
+      assert.equal(editCh16?.approvalStatus, 'rejected');
+      assert.equal(editCh16?.duplicateFlag, true);
+      assert.equal(editCh16?.amountIdr, 0);
+      assert.equal(editCh17?.approvalStatus, 'auto_approved');
+      assert.equal(editCh17?.duplicateFlag, false);
 
-      // Case 6: Delete Worker A's report (CH 4) and void Worker B/C pending -> new Ch. 4 report succeeds
+      // Case 5: Delete original Ch 15 report -> Ch 15 becomes available again for a new report
       await handleDiscordMessageDelete(db, '900000000000000401', adminActor, 'Hapus laporan awal');
-      await handleDiscordMessageDelete(db, '900000000000000402', adminActor, 'Hapus duplikat');
-      await handleDiscordMessageDelete(db, '900000000000000405', adminActor, 'Hapus konflik edit');
 
       const freshAfterDelete = await processDiscordReport(db, {
-        discordMessageId: '900000000000000406',
+        discordMessageId: '900000000000000405',
         discordGuildId: guild.discordGuildId,
         discordChannelId: fileTlChannelId,
         discordChannelName: 'file-tl',
         discordAuthorId: '770000000000000704',
         authorUsername: 'worker_d',
         authorDisplayName: 'Worker D',
-        content: '<#1352988212079104031> Nano Machine CH 04 ETL Done',
+        content: '<#1352988212079104031> Solo Leveling CH 15 ETL Done',
         mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
       });
       assert.equal(freshAfterDelete.outcome, 'PROCESSED');
       assert.equal(freshAfterDelete.isPending, false);
+      assert.equal(freshAfterDelete.isRejected, false);
       assert.equal(freshAfterDelete.approvalStatus, 'approved');
+      assert.deepEqual(freshAfterDelete.acceptedChapters, [15]);
     });
 
     console.log(`\nALL ${passed} CORE POSTGRESQL & PAYROLL TEST SUITES PASSED.`);

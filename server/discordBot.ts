@@ -43,7 +43,7 @@ import {
   reportChapters,
 } from './schema.ts';
 import { formatIdr, getJakartaDateParts } from './time.ts';
-import type { AdminRole, AuthUser, RoleName } from './types.ts';
+import type { AdminRole, AuthUser, RejectedDuplicateChapter, RoleName } from './types.ts';
 
 export interface BotRuntimeState {
   status: 'CONNECTED' | 'CONNECTING' | 'STANDBY_NO_TOKEN' | 'ERROR';
@@ -104,7 +104,10 @@ export function formatReportAcceptedMessage(params: {
   chapterDisplay?: string | null;
   totalChapters?: number;
   isPending?: boolean;
+  isRejected?: boolean;
   pendingReason?: string | null;
+  acceptedChapters?: number[];
+  rejectedDuplicates?: RejectedDuplicateChapter[];
 }): string {
   const title = params.projectTitle?.trim() || '-';
   const chapter = params.chapterDisplay?.trim() || '-';
@@ -112,6 +115,63 @@ export function formatReportAcceptedMessage(params: {
     typeof params.totalChapters === 'number' && Number.isFinite(params.totalChapters)
       ? Math.max(0, Math.trunc(params.totalChapters))
       : 0;
+
+  const rejectedDuplicates = (params.rejectedDuplicates ?? [])
+    .slice()
+    .sort((a, b) => a.chapterNumber - b.chapterNumber);
+
+  if (rejectedDuplicates.length > 0 && !params.isPending) {
+    const rejectedList = rejectedDuplicates.map((c) => String(c.chapterNumber)).join('&');
+
+    // Group rejected chapters by previous reporter in order of first appearance
+    const groupedByReporter: Array<{ discordId: string; chapters: number[] }> = [];
+    for (const item of rejectedDuplicates) {
+      const existing = groupedByReporter.find((g) => g.discordId === item.previousReporterDiscordId);
+      if (existing) {
+        existing.chapters.push(item.chapterNumber);
+      } else {
+        groupedByReporter.push({
+          discordId: item.previousReporterDiscordId,
+          chapters: [item.chapterNumber],
+        });
+      }
+    }
+
+    const prevClause = groupedByReporter
+      .map((g) => `chapter ${g.chapters.join('&')} pernah dilapor sebelumnya oleh <@${g.discordId}>`)
+      .join(' dan ');
+
+    const acceptedList =
+      params.acceptedChapters && params.acceptedChapters.length > 0
+        ? params.acceptedChapters.join('&')
+        : chapter !== '-'
+          ? chapter
+          : '';
+    const acceptedCount =
+      params.acceptedChapters !== undefined ? params.acceptedChapters.length : totalChapter;
+
+    if (acceptedCount > 0 && acceptedList) {
+      return [
+        `<@${params.discordAuthorId}> Laporan Diterima`,
+        `Judul : ${title}`,
+        `Chapter : ${acceptedList}`,
+        `total chapter : ${acceptedCount}`,
+        '',
+        'Laporan kamu sukses tercatat',
+        `pesan : ${prevClause}, laporan yang tercatat chapter ${acceptedList}, jika itu dilapor bukan olehmu, parani orang tersebut, saya sudah tag orang yang melapor chapter ${rejectedList}`,
+      ].join('\n');
+    }
+
+    return [
+      `<@${params.discordAuthorId}> Laporan Ditolak`,
+      `Judul : ${title}`,
+      'Chapter : -',
+      'total chapter : 0',
+      '',
+      'Laporan kamu ditolak',
+      `pesan : ${prevClause}, tidak ada chapter baru yang tercatat, jika itu dilapor bukan olehmu, parani orang tersebut, saya sudah tag orang yang melapor chapter ${rejectedList}`,
+    ].join('\n');
+  }
 
   const lines = [
     `<@${params.discordAuthorId}> Laporan Diterima`,
@@ -973,11 +1033,17 @@ export async function startDiscordBotIfConfigured(db: AppDb): Promise<void> {
             chapterDisplay: res.chapterDisplay,
             totalChapters: res.totalChapters,
             isPending: res.isPending,
+            isRejected: res.isRejected,
             pendingReason: res.pendingReason,
+            acceptedChapters: res.acceptedChapters,
+            rejectedDuplicates: res.rejectedDuplicates,
           });
-          await message.reply(replyText).catch((err) =>
-            console.error('[DiscordBot] Reply error:', err)
-          );
+          await message
+            .reply({
+              content: replyText,
+              allowedMentions: { parse: ['users'] },
+            })
+            .catch((err) => console.error('[DiscordBot] Reply error:', err));
         }
       } catch (err) {
         console.error('[DiscordBot] MessageCreate error:', err);

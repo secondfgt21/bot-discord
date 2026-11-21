@@ -49,3 +49,13 @@ export interface AuthUser {
   role: AdminRole;
   discordUserId?: string | null;
 }
+
+export interface RejectedDuplicateChapter {
+  chapterNumber: number;
+  previousChapterId: string;
+  previousReportId: string;
+  previousReporterDiscordId: string;
+  previousReporterName: string;
+  previousApprovalStatus: string;
+}
+

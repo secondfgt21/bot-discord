@@ -30,7 +30,13 @@ import {
   roleAliases,
 } from './schema.ts';
 import { formatIdr, getJakartaDateParts } from './time.ts';
-import type { AuthUser, IncomingDiscordMessage, ParsedReportResult, RoleName } from './types.ts';
+import type {
+  AuthUser,
+  IncomingDiscordMessage,
+  ParsedReportResult,
+  RejectedDuplicateChapter,
+  RoleName,
+} from './types.ts';
 
 export async function writeAuditLog(
   db: AppDb,
@@ -518,6 +524,7 @@ interface ChapterConflict {
   chapterNumber: number;
   chapterId: string;
   reportId: string;
+  reporterDiscordId: string;
   reporterName: string;
   approvalStatus: string;
 }
@@ -599,6 +606,7 @@ async function findConflictingChapterReports(
       chapterId: reportChapters.id,
       reportId: reportChapters.reportId,
       approvalStatus: reportChapters.approvalStatus,
+      reporterDiscordId: members.discordUserId,
       reporterName: members.displayName,
     })
     .from(reportChapters)
@@ -613,6 +621,7 @@ async function findConflictingChapterReports(
         chapterNumber: row.chapterNumber,
         chapterId: row.chapterId,
         reportId: row.reportId,
+        reporterDiscordId: row.reporterDiscordId,
         reporterName: row.reporterName,
         approvalStatus: row.approvalStatus,
       });
@@ -622,27 +631,26 @@ async function findConflictingChapterReports(
   return conflicts;
 }
 
-function buildDuplicatePendingReason(params: {
+function buildDuplicateAuditNote(params: {
   projectTitle: string | null;
   role: RoleName | null;
   conflicts: ChapterConflict[];
+  acceptedChapters: number[];
 }): string {
   const titleLabel = params.projectTitle ? `"${params.projectTitle}"` : 'komik terkait';
   const roleLabel = params.role || 'role terkait';
   const sorted = [...params.conflicts].sort((a, b) => a.chapterNumber - b.chapterNumber);
-
-  if (sorted.length === 1) {
-    const c = sorted[0];
-    return `Chapter duplikat untuk komik ${titleLabel} (Role: ${roleLabel}) pada Ch. ${c.chapterNumber} — sudah tercatat sebelumnya oleh ${c.reporterName} (Status: ${formatConflictStatusLabel(c.approvalStatus)}).`;
-  }
-
   const details = sorted
     .map(
       (c) =>
-        `Ch. ${c.chapterNumber} (oleh ${c.reporterName}, Status: ${formatConflictStatusLabel(c.approvalStatus)})`
+        `Ch. ${c.chapterNumber} (oleh ${c.reporterName} <@${c.reporterDiscordId}>, Status: ${formatConflictStatusLabel(c.approvalStatus)})`
     )
     .join(', ');
-  return `Chapter duplikat untuk komik ${titleLabel} (Role: ${roleLabel}) pada ${details} — sudah tercatat sebelumnya.`;
+  const acceptedInfo =
+    params.acceptedChapters.length > 0
+      ? ` Chapter yang tercatat: ${params.acceptedChapters.join('&')}.`
+      : ' Tidak ada chapter baru yang tercatat.';
+  return `Chapter duplikat ditolak untuk komik ${titleLabel} (Role: ${roleLabel}) pada ${details}.${acceptedInfo}`;
 }
 
 export async function processDiscordReport(
@@ -660,12 +668,15 @@ export async function processDiscordReport(
   projectTitle?: string | null;
   chapterDisplay?: string;
   chapters?: number[];
+  acceptedChapters?: number[];
+  rejectedDuplicates?: RejectedDuplicateChapter[];
   totalChapters?: number;
   chaptersCreated?: number;
   totalAmountIdr?: number;
   approvalSummary?: string;
-  approvalStatus?: 'approved' | 'pending';
+  approvalStatus?: 'approved' | 'pending' | 'rejected';
   isPending?: boolean;
+  isRejected?: boolean;
   pendingReason?: string | null;
 }> {
   if (!/^\d+$/.test(msg.discordMessageId) || !/^\d+$/.test(msg.discordAuthorId) || !/^\d+$/.test(msg.discordChannelId)) {
@@ -775,34 +786,55 @@ export async function processDiscordReport(
       chapters: chaptersToInsert,
       excludeReportId: createdReport.id,
     });
-    const hasDuplicateConflict = conflictMap.size > 0;
-    const duplicateConflicts = Array.from(conflictMap.values());
+    const duplicateConflicts = Array.from(conflictMap.values()).sort(
+      (a, b) => a.chapterNumber - b.chapterNumber
+    );
 
     let autoApprovedCount = 0;
     let pendingCount = 0;
+    let rejectedCount = 0;
     let totalAmountIdr = 0;
+    const acceptedChapters: number[] = [];
+    const rejectedDuplicates: RejectedDuplicateChapter[] = [];
 
     for (const chNum of chaptersToInsert) {
       const conflict = conflictMap.get(chNum);
       const duplicateFlag = Boolean(conflict);
       const duplicateOfId = conflict?.chapterId ?? null;
 
-      const isCleanAutoApprove =
-        parsed.parseStatus !== 'PROJECT_CHANNEL_CONFLICT' &&
-        !periodIsClosed &&
-        !hasDuplicateConflict &&
-        chNum > 0 &&
-        parsed.role !== null &&
-        parsed.projectId !== null;
+      let approvalStatus: 'auto_approved' | 'pending' | 'rejected';
+      let amount = 0;
 
-      const approvalStatus = isCleanAutoApprove ? 'auto_approved' : 'pending';
-      const amount = parsed.role && chNum > 0 ? unitRate : 0;
-
-      if (approvalStatus === 'auto_approved') {
-        autoApprovedCount += 1;
-        totalAmountIdr += amount;
+      if (conflict) {
+        approvalStatus = 'rejected';
+        amount = 0;
+        rejectedCount += 1;
+        rejectedDuplicates.push({
+          chapterNumber: chNum,
+          previousChapterId: conflict.chapterId,
+          previousReportId: conflict.reportId,
+          previousReporterDiscordId: conflict.reporterDiscordId,
+          previousReporterName: conflict.reporterName,
+          previousApprovalStatus: conflict.approvalStatus,
+        });
       } else {
-        pendingCount += 1;
+        const isCleanAutoApprove =
+          parsed.parseStatus !== 'PROJECT_CHANNEL_CONFLICT' &&
+          !periodIsClosed &&
+          chNum > 0 &&
+          parsed.role !== null &&
+          parsed.projectId !== null;
+
+        approvalStatus = isCleanAutoApprove ? 'auto_approved' : 'pending';
+        amount = parsed.role && chNum > 0 ? unitRate : 0;
+
+        if (approvalStatus === 'auto_approved') {
+          autoApprovedCount += 1;
+          totalAmountIdr += amount;
+          acceptedChapters.push(chNum);
+        } else {
+          pendingCount += 1;
+        }
       }
 
       await txDb.insert(reportChapters).values({
@@ -818,12 +850,34 @@ export async function processDiscordReport(
         approvalStatus,
         duplicateFlag,
         duplicateOfChapterId: duplicateOfId,
-        approvedBy: isCleanAutoApprove ? 'system:auto_approval' : null,
-        approvedAt: isCleanAutoApprove ? now : null,
+        approvedBy:
+          approvalStatus === 'auto_approved'
+            ? 'system:auto_approval'
+            : approvalStatus === 'rejected'
+              ? 'system:duplicate_reject'
+              : null,
+        approvedAt: approvalStatus === 'auto_approved' ? now : null,
       });
     }
 
     const isPending = pendingCount > 0;
+    const isRejected = autoApprovedCount === 0 && pendingCount === 0 && rejectedCount > 0;
+    let duplicateAuditNote: string | null = null;
+
+    if (duplicateConflicts.length > 0) {
+      duplicateAuditNote = buildDuplicateAuditNote({
+        projectTitle: resolvedTitle,
+        role: parsed.role,
+        conflicts: duplicateConflicts,
+        acceptedChapters,
+      });
+      parsed.parseNotes.push(duplicateAuditNote);
+      await txDb
+        .update(reports)
+        .set({ parseNotesJson: parsed.parseNotes, updatedAt: now })
+        .where(eq(reports.id, createdReport.id));
+    }
+
     let pendingReason: string | null = null;
     if (isPending) {
       const reasons: string[] = [];
@@ -832,19 +886,6 @@ export async function processDiscordReport(
         if (trimmed && !reasons.includes(trimmed)) {
           reasons.push(trimmed);
         }
-      }
-      if (duplicateConflicts.length > 0) {
-        const dupReason = buildDuplicatePendingReason({
-          projectTitle: resolvedTitle,
-          role: parsed.role,
-          conflicts: duplicateConflicts,
-        });
-        reasons.push(dupReason);
-        parsed.parseNotes.push(dupReason);
-        await txDb
-          .update(reports)
-          .set({ parseNotesJson: parsed.parseNotes, updatedAt: now })
-          .where(eq(reports.id, createdReport.id));
       }
       pendingReason =
         reasons.length > 0
@@ -859,12 +900,18 @@ export async function processDiscordReport(
       afterJson: {
         parseStatus: parsed.parseStatus,
         chapters: parsed.chapters,
+        acceptedChapters,
+        rejectedDuplicates,
         role: parsed.role,
         projectId: parsed.projectId,
       },
       actorType: 'discord_bot',
       actorId: msg.discordAuthorId,
-      reason: pendingReason || parsed.parseNotes.join('; ') || 'Parsed from Discord message',
+      reason:
+        pendingReason ||
+        duplicateAuditNote ||
+        parsed.parseNotes.join('; ') ||
+        'Parsed from Discord message',
     });
 
     if (!periodIsClosed) {
@@ -884,13 +931,27 @@ export async function processDiscordReport(
         },
         dedupKey: `report_pending:${msg.discordMessageId}`,
       });
+    } else if (isRejected) {
+      await createNotification(txDb, {
+        guildId: guild.id,
+        type: 'REPORT_DUPLICATE_REJECTED',
+        title: `Laporan Duplikat Ditolak (${member.displayName})`,
+        message: duplicateAuditNote || msg.content.slice(0, 140),
+        payload: {
+          reportId: createdReport.id,
+          rejectedDuplicates,
+        },
+        dedupKey: `report_rejected:${msg.discordMessageId}`,
+      });
     } else {
       await createNotification(txDb, {
         guildId: guild.id,
         type: 'REPORT_AUTO_APPROVED',
         title: `Laporan Disetujui Otomatis (${member.displayName})`,
-        message: `${autoApprovedCount} chapter (${parsed.role}) · ${formatIdr(totalAmountIdr)}`,
-        payload: { reportId: createdReport.id },
+        message: `${autoApprovedCount} chapter (${parsed.role}) · ${formatIdr(totalAmountIdr)}${
+          rejectedCount > 0 ? ` · ${rejectedCount} duplikat ditolak` : ''
+        }`,
+        payload: { reportId: createdReport.id, acceptedChapters, rejectedDuplicates },
         dedupKey: `report_approved:${msg.discordMessageId}`,
       });
     }
@@ -916,21 +977,44 @@ export async function processDiscordReport(
         },
       });
 
+    const hasRejectedDuplicates = rejectedDuplicates.length > 0;
+    const effectiveChapterDisplay = hasRejectedDuplicates
+      ? acceptedChapters.length > 0
+        ? acceptedChapters.join('&')
+        : '-'
+      : parsed.chapterDisplay;
+    const effectiveTotalChapters = hasRejectedDuplicates
+      ? acceptedChapters.length
+      : parsed.chapters.length;
+
+    const approvalSummary = isPending
+      ? `${pendingCount} chapter pending review`
+      : isRejected
+        ? `${rejectedCount} chapter duplikat ditolak`
+        : rejectedCount > 0
+          ? `${autoApprovedCount} chapter auto-approved, ${rejectedCount} chapter duplikat ditolak`
+          : `${autoApprovedCount} chapter auto-approved`;
+
     return {
       outcome: 'PROCESSED' as const,
       reportId: createdReport.id,
       parseStatus: parsed.parseStatus,
-      projectTitle: parsed.projectTitleMatched ?? parsed.extractedTitle ?? null,
-      chapterDisplay: parsed.chapterDisplay,
+      projectTitle: resolvedTitle,
+      chapterDisplay: effectiveChapterDisplay,
       chapters: parsed.chapters,
-      totalChapters: parsed.chapters.length,
+      acceptedChapters,
+      rejectedDuplicates,
+      totalChapters: effectiveTotalChapters,
       chaptersCreated: chaptersToInsert.length,
       totalAmountIdr,
-      approvalSummary: isPending
-        ? `${pendingCount} chapter pending review`
-        : `${autoApprovedCount} chapter auto-approved`,
-      approvalStatus: isPending ? ('pending' as const) : ('approved' as const),
+      approvalSummary,
+      approvalStatus: isPending
+        ? ('pending' as const)
+        : isRejected
+          ? ('rejected' as const)
+          : ('approved' as const),
       isPending,
+      isRejected,
       pendingReason,
     };
   });
@@ -1030,18 +1114,67 @@ export async function handleDiscordMessageEdit(
       chapters: chaptersToInsert,
       excludeReportId: existing.id,
     });
-    const hasDuplicateConflict = conflictMap.size > 0;
-    const duplicateConflicts = Array.from(conflictMap.values());
+    const duplicateConflicts = Array.from(conflictMap.values()).sort(
+      (a, b) => a.chapterNumber - b.chapterNumber
+    );
     const editNotes = [...parsed.parseNotes];
-    let dupReason: string | null = null;
+    const editAcceptedChapters: number[] = [];
 
+    for (const chNum of chaptersToInsert) {
+      const conflict = conflictMap.get(chNum);
+      const duplicateFlag = Boolean(conflict);
+      const duplicateOfId = conflict?.chapterId ?? null;
+
+      let approvalStatus: 'auto_approved' | 'pending' | 'rejected';
+      let amount = 0;
+
+      if (conflict) {
+        approvalStatus = 'rejected';
+        amount = 0;
+      } else {
+        const isClean =
+          parsed.isReport &&
+          parsed.parseStatus === 'VALID' &&
+          chNum > 0 &&
+          parsed.role !== null &&
+          parsed.projectId !== null;
+        approvalStatus = isClean ? 'auto_approved' : 'pending';
+        amount = parsed.role && chNum > 0 ? unitRate : 0;
+        if (isClean) editAcceptedChapters.push(chNum);
+      }
+
+      await txDb.insert(reportChapters).values({
+        reportId: existing.id,
+        guildId: existing.guildId,
+        periodId: existing.periodId,
+        memberId: existing.memberId,
+        projectId: parsed.projectId,
+        chapterNumber: chNum,
+        role: parsed.role,
+        unitRateIdr: unitRate,
+        amountIdr: amount,
+        approvalStatus,
+        duplicateFlag,
+        duplicateOfChapterId: duplicateOfId,
+        approvedBy:
+          approvalStatus === 'auto_approved'
+            ? 'system:edit_sync'
+            : approvalStatus === 'rejected'
+              ? 'system:duplicate_reject'
+              : null,
+        approvedAt: approvalStatus === 'auto_approved' ? now : null,
+      });
+    }
+
+    let dupNote: string | null = null;
     if (duplicateConflicts.length > 0) {
-      dupReason = buildDuplicatePendingReason({
+      dupNote = buildDuplicateAuditNote({
         projectTitle: resolvedTitle,
         role: parsed.role,
         conflicts: duplicateConflicts,
+        acceptedChapters: editAcceptedChapters,
       });
-      editNotes.push(dupReason);
+      editNotes.push(dupNote);
     }
 
     await txDb
@@ -1055,36 +1188,6 @@ export async function handleDiscordMessageEdit(
       })
       .where(eq(reports.id, existing.id));
 
-    for (const chNum of chaptersToInsert) {
-      const conflict = conflictMap.get(chNum);
-      const duplicateFlag = Boolean(conflict);
-      const duplicateOfId = conflict?.chapterId ?? null;
-      const isClean =
-        parsed.isReport &&
-        parsed.parseStatus === 'VALID' &&
-        !hasDuplicateConflict &&
-        chNum > 0 &&
-        parsed.role !== null &&
-        parsed.projectId !== null;
-
-      await txDb.insert(reportChapters).values({
-        reportId: existing.id,
-        guildId: existing.guildId,
-        periodId: existing.periodId,
-        memberId: existing.memberId,
-        projectId: parsed.projectId,
-        chapterNumber: chNum,
-        role: parsed.role,
-        unitRateIdr: unitRate,
-        amountIdr: parsed.role && chNum > 0 ? unitRate : 0,
-        approvalStatus: isClean ? 'auto_approved' : 'pending',
-        duplicateFlag,
-        duplicateOfChapterId: duplicateOfId,
-        approvedBy: isClean ? 'system:edit_sync' : null,
-        approvedAt: isClean ? now : null,
-      });
-    }
-
     await txDb.insert(reportEvents).values({
       reportId: existing.id,
       eventType: 'EDITED',
@@ -1092,12 +1195,13 @@ export async function handleDiscordMessageEdit(
       afterJson: {
         rawContent: msg.content,
         chapters: parsed.chapters,
+        acceptedChapters: editAcceptedChapters,
         role: parsed.role,
         duplicateConflicts,
       },
       actorType: 'discord_bot',
       actorId: msg.discordAuthorId,
-      reason: dupReason || 'Discord message edited & resynced',
+      reason: dupNote || 'Discord message edited & resynced',
     });
 
     await recalculatePayrollForMemberPeriod(txDb, existing.guildId, existing.periodId, existing.memberId);
