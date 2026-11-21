@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, notInArray, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, ne, notInArray, sql } from 'drizzle-orm';
 import { ensurePeriodExists, seedGuildDefaults, type AppDb } from './db.ts';
 import {
   isNonComicChannel,
@@ -514,6 +514,137 @@ export async function upsertMemberByDiscordId(
   return created;
 }
 
+interface ChapterConflict {
+  chapterNumber: number;
+  chapterId: string;
+  reportId: string;
+  reporterName: string;
+  approvalStatus: string;
+}
+
+function normalizeProjectKey(title: string): string {
+  return title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function formatConflictStatusLabel(status: string): string {
+  if (status === 'auto_approved' || status === 'approved') return 'Disetujui';
+  if (status === 'pending') return 'Pending';
+  return status;
+}
+
+async function findConflictingChapterReports(
+  db: AppDb,
+  params: {
+    guildId: string;
+    projectId: string | null;
+    projectTitle?: string | null;
+    role: RoleName | null;
+    chapters: number[];
+    excludeReportId?: string;
+  }
+): Promise<Map<number, ChapterConflict>> {
+  const conflicts = new Map<number, ChapterConflict>();
+  const validChapters = Array.from(
+    new Set(params.chapters.filter((ch) => Number.isInteger(ch) && ch > 0))
+  );
+  if (!params.role || validChapters.length === 0 || (!params.projectId && !params.projectTitle)) {
+    return conflicts;
+  }
+
+  const matchingProjectIds = new Set<string>();
+  if (params.projectId) {
+    matchingProjectIds.add(params.projectId);
+  }
+
+  const normalizedKey = params.projectTitle ? normalizeProjectKey(params.projectTitle) : '';
+  if (normalizedKey) {
+    const guildProjects = await db
+      .select({ id: projects.id, title: projects.title, slug: projects.slug })
+      .from(projects)
+      .where(eq(projects.guildId, params.guildId));
+    for (const p of guildProjects) {
+      if (
+        p.id === params.projectId ||
+        p.slug === normalizedKey ||
+        normalizeProjectKey(p.title) === normalizedKey
+      ) {
+        matchingProjectIds.add(p.id);
+      }
+    }
+  }
+
+  if (matchingProjectIds.size === 0) {
+    return conflicts;
+  }
+
+  const conditions = [
+    eq(reportChapters.guildId, params.guildId),
+    inArray(reportChapters.projectId, Array.from(matchingProjectIds)),
+    eq(reportChapters.role, params.role),
+    inArray(reportChapters.chapterNumber, validChapters),
+    notInArray(reportChapters.approvalStatus, ['rejected', 'void']),
+    eq(reports.isDeleted, false),
+  ];
+
+  if (params.excludeReportId) {
+    conditions.push(ne(reportChapters.reportId, params.excludeReportId));
+  }
+
+  const rows = await db
+    .select({
+      chapterNumber: reportChapters.chapterNumber,
+      chapterId: reportChapters.id,
+      reportId: reportChapters.reportId,
+      approvalStatus: reportChapters.approvalStatus,
+      reporterName: members.displayName,
+    })
+    .from(reportChapters)
+    .innerJoin(reports, eq(reportChapters.reportId, reports.id))
+    .innerJoin(members, eq(reportChapters.memberId, members.id))
+    .where(and(...conditions))
+    .orderBy(reportChapters.createdAt);
+
+  for (const row of rows) {
+    if (!conflicts.has(row.chapterNumber)) {
+      conflicts.set(row.chapterNumber, {
+        chapterNumber: row.chapterNumber,
+        chapterId: row.chapterId,
+        reportId: row.reportId,
+        reporterName: row.reporterName,
+        approvalStatus: row.approvalStatus,
+      });
+    }
+  }
+
+  return conflicts;
+}
+
+function buildDuplicatePendingReason(params: {
+  projectTitle: string | null;
+  role: RoleName | null;
+  conflicts: ChapterConflict[];
+}): string {
+  const titleLabel = params.projectTitle ? `"${params.projectTitle}"` : 'komik terkait';
+  const roleLabel = params.role || 'role terkait';
+  const sorted = [...params.conflicts].sort((a, b) => a.chapterNumber - b.chapterNumber);
+
+  if (sorted.length === 1) {
+    const c = sorted[0];
+    return `Chapter duplikat untuk komik ${titleLabel} (Role: ${roleLabel}) pada Ch. ${c.chapterNumber} — sudah tercatat sebelumnya oleh ${c.reporterName} (Status: ${formatConflictStatusLabel(c.approvalStatus)}).`;
+  }
+
+  const details = sorted
+    .map(
+      (c) =>
+        `Ch. ${c.chapterNumber} (oleh ${c.reporterName}, Status: ${formatConflictStatusLabel(c.approvalStatus)})`
+    )
+    .join(', ');
+  return `Chapter duplikat untuk komik ${titleLabel} (Role: ${roleLabel}) pada ${details} — sudah tercatat sebelumnya.`;
+}
+
 export async function processDiscordReport(
   db: AppDb,
   msg: IncomingDiscordMessage,
@@ -635,42 +766,31 @@ export async function processDiscordReport(
     const unitRate = parsed.role ? rates[parsed.role] : 0;
 
     const chaptersToInsert = parsed.chapters.length > 0 ? parsed.chapters : [0];
+    const resolvedTitle = parsed.projectTitleMatched ?? parsed.extractedTitle ?? null;
+    const conflictMap = await findConflictingChapterReports(txDb, {
+      guildId: guild.id,
+      projectId: parsed.projectId,
+      projectTitle: resolvedTitle,
+      role: parsed.role,
+      chapters: chaptersToInsert,
+      excludeReportId: createdReport.id,
+    });
+    const hasDuplicateConflict = conflictMap.size > 0;
+    const duplicateConflicts = Array.from(conflictMap.values());
+
     let autoApprovedCount = 0;
     let pendingCount = 0;
     let totalAmountIdr = 0;
-    const duplicateChapters: number[] = [];
 
     for (const chNum of chaptersToInsert) {
-      let duplicateOfId: string | null = null;
-      let duplicateFlag = false;
-
-      if (chNum > 0 && parsed.projectId && parsed.role) {
-        const dupRows = await txDb
-          .select({ id: reportChapters.id })
-          .from(reportChapters)
-          .where(
-            and(
-              eq(reportChapters.guildId, guild.id),
-              eq(reportChapters.projectId, parsed.projectId),
-              eq(reportChapters.chapterNumber, chNum),
-              eq(reportChapters.memberId, member.id),
-              eq(reportChapters.role, parsed.role),
-              notInArray(reportChapters.approvalStatus, ['rejected', 'void'])
-            )
-          )
-          .limit(1);
-
-        if (dupRows.length > 0) {
-          duplicateFlag = true;
-          duplicateOfId = dupRows[0].id;
-          duplicateChapters.push(chNum);
-        }
-      }
+      const conflict = conflictMap.get(chNum);
+      const duplicateFlag = Boolean(conflict);
+      const duplicateOfId = conflict?.chapterId ?? null;
 
       const isCleanAutoApprove =
         parsed.parseStatus !== 'PROJECT_CHANNEL_CONFLICT' &&
         !periodIsClosed &&
-        !duplicateFlag &&
+        !hasDuplicateConflict &&
         chNum > 0 &&
         parsed.role !== null &&
         parsed.projectId !== null;
@@ -713,9 +833,18 @@ export async function processDiscordReport(
           reasons.push(trimmed);
         }
       }
-      if (duplicateChapters.length > 0) {
-        const dupList = duplicateChapters.map((c) => `Ch. ${c}`).join(', ');
-        reasons.push(`Chapter duplikat terdeteksi (${dupList}) sudah pernah dilaporkan sebelumnya.`);
+      if (duplicateConflicts.length > 0) {
+        const dupReason = buildDuplicatePendingReason({
+          projectTitle: resolvedTitle,
+          role: parsed.role,
+          conflicts: duplicateConflicts,
+        });
+        reasons.push(dupReason);
+        parsed.parseNotes.push(dupReason);
+        await txDb
+          .update(reports)
+          .set({ parseNotesJson: parsed.parseNotes, updatedAt: now })
+          .where(eq(reports.id, createdReport.id));
       }
       pendingReason =
         reasons.length > 0
@@ -882,16 +1011,6 @@ export async function handleDiscordMessageEdit(
 
   await db.transaction(async (tx) => {
     const txDb = tx as unknown as AppDb;
-    await txDb
-      .update(reports)
-      .set({
-        rawContent: msg.content,
-        projectId: parsed.projectId,
-        parseStatus: parsed.parseStatus,
-        parseNotesJson: parsed.parseNotes,
-        updatedAt: now,
-      })
-      .where(eq(reports.id, existing.id));
 
     await txDb
       .update(reportChapters)
@@ -901,11 +1020,49 @@ export async function handleDiscordMessageEdit(
     const rates = await getActiveRatesMap(txDb, existing.guildId);
     const unitRate = parsed.role ? rates[parsed.role] : 0;
     const chaptersToInsert = parsed.chapters.length > 0 ? parsed.chapters : [0];
+    const resolvedTitle = parsed.projectTitleMatched ?? parsed.extractedTitle ?? null;
+
+    const conflictMap = await findConflictingChapterReports(txDb, {
+      guildId: existing.guildId,
+      projectId: parsed.projectId,
+      projectTitle: resolvedTitle,
+      role: parsed.role,
+      chapters: chaptersToInsert,
+      excludeReportId: existing.id,
+    });
+    const hasDuplicateConflict = conflictMap.size > 0;
+    const duplicateConflicts = Array.from(conflictMap.values());
+    const editNotes = [...parsed.parseNotes];
+    let dupReason: string | null = null;
+
+    if (duplicateConflicts.length > 0) {
+      dupReason = buildDuplicatePendingReason({
+        projectTitle: resolvedTitle,
+        role: parsed.role,
+        conflicts: duplicateConflicts,
+      });
+      editNotes.push(dupReason);
+    }
+
+    await txDb
+      .update(reports)
+      .set({
+        rawContent: msg.content,
+        projectId: parsed.projectId,
+        parseStatus: parsed.parseStatus,
+        parseNotesJson: editNotes,
+        updatedAt: now,
+      })
+      .where(eq(reports.id, existing.id));
 
     for (const chNum of chaptersToInsert) {
+      const conflict = conflictMap.get(chNum);
+      const duplicateFlag = Boolean(conflict);
+      const duplicateOfId = conflict?.chapterId ?? null;
       const isClean =
         parsed.isReport &&
         parsed.parseStatus === 'VALID' &&
+        !hasDuplicateConflict &&
         chNum > 0 &&
         parsed.role !== null &&
         parsed.projectId !== null;
@@ -921,7 +1078,8 @@ export async function handleDiscordMessageEdit(
         unitRateIdr: unitRate,
         amountIdr: parsed.role && chNum > 0 ? unitRate : 0,
         approvalStatus: isClean ? 'auto_approved' : 'pending',
-        duplicateFlag: false,
+        duplicateFlag,
+        duplicateOfChapterId: duplicateOfId,
         approvedBy: isClean ? 'system:edit_sync' : null,
         approvedAt: isClean ? now : null,
       });
@@ -931,10 +1089,15 @@ export async function handleDiscordMessageEdit(
       reportId: existing.id,
       eventType: 'EDITED',
       beforeJson: { rawContent: existing.rawContent, chapters: oldChapters },
-      afterJson: { rawContent: msg.content, chapters: parsed.chapters, role: parsed.role },
+      afterJson: {
+        rawContent: msg.content,
+        chapters: parsed.chapters,
+        role: parsed.role,
+        duplicateConflicts,
+      },
       actorType: 'discord_bot',
       actorId: msg.discordAuthorId,
-      reason: 'Discord message edited & resynced',
+      reason: dupReason || 'Discord message edited & resynced',
     });
 
     await recalculatePayrollForMemberPeriod(txDb, existing.guildId, existing.periodId, existing.memberId);

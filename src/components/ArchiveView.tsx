@@ -1,7 +1,14 @@
 import React, { useEffect, useState } from 'react';
-import { Lock, Unlock, X } from 'lucide-react';
+import { Archive, FileSpreadsheet, Loader2, Lock, Unlock, X } from 'lucide-react';
 import { apiFetch, downloadExportFile, formatIdr, formatJakartaDateTime } from '../lib/api.ts';
 import type { AuthUser } from '../types.ts';
+import {
+  CardSkeletonGrid,
+  ConfirmModal,
+  EmptyState,
+  StatusBadge,
+  useToast,
+} from './ui/DashboardUI.tsx';
 
 interface ArchivePeriod {
   id: string;
@@ -34,14 +41,18 @@ export function ArchiveView({
   user: AuthUser;
   onPeriodsUpdated: () => void;
 }) {
+  const toast = useToast();
   const [archives, setArchives] = useState<ArchivePeriod[]>([]);
   const [loading, setLoading] = useState(true);
-  const [feedback, setFeedback] = useState<string | null>(null);
   const [compareA, setCompareA] = useState('');
   const [compareB, setCompareB] = useState('');
 
+  const [closeTarget, setCloseTarget] = useState<ArchivePeriod | null>(null);
+  const [closing, setClosing] = useState(false);
+
   const [reopenTarget, setReopenTarget] = useState<ArchivePeriod | null>(null);
   const [reopenReason, setReopenReason] = useState('');
+  const [reopening, setReopening] = useState(false);
 
   async function loadArchives() {
     setLoading(true);
@@ -54,6 +65,8 @@ export function ArchiveView({
       } else if (res.archives.length === 1) {
         setCompareA(res.archives[0].id);
       }
+    } catch (err) {
+      toast.error('Gagal memuat arsip periode', err instanceof Error ? err.message : undefined);
     } finally {
       setLoading(false);
     }
@@ -63,34 +76,43 @@ export function ArchiveView({
     void loadArchives();
   }, []);
 
-  async function handleClosePeriod(p: ArchivePeriod) {
-    setFeedback(null);
+  async function confirmClosePeriod() {
+    if (!closeTarget) return;
+    setClosing(true);
     try {
-      await apiFetch(`/periods/${p.id}/close`, { method: 'POST' });
-      setFeedback(`Periode ${p.period_key} berhasil ditutup (CLOSED).`);
+      await apiFetch(`/periods/${closeTarget.id}/close`, { method: 'POST' });
+      toast.success(
+        `Periode ${closeTarget.period_key} ditutup`,
+        'Status berubah menjadi CLOSED. Pembayaran langsung dan edit pesan otomatis dikunci.'
+      );
+      setCloseTarget(null);
       await loadArchives();
       onPeriodsUpdated();
     } catch (err) {
-      setFeedback(err instanceof Error ? err.message : 'Gagal menutup periode.');
+      toast.error('Gagal menutup periode', err instanceof Error ? err.message : undefined);
+    } finally {
+      setClosing(false);
     }
   }
 
   async function submitReopen(e: React.FormEvent) {
     e.preventDefault();
     if (!reopenTarget) return;
-    setFeedback(null);
+    setReopening(true);
     try {
       await apiFetch(`/periods/${reopenTarget.id}/reopen`, {
         method: 'POST',
         body: JSON.stringify({ reason: reopenReason }),
       });
+      toast.success(`Periode ${reopenTarget.period_key} dibuka kembali (REOPENED).`);
       setReopenTarget(null);
       setReopenReason('');
-      setFeedback('Periode berhasil dibuka kembali (REOPENED).');
       await loadArchives();
       onPeriodsUpdated();
     } catch (err) {
-      setFeedback(err instanceof Error ? err.message : 'Gagal membuka kembali periode.');
+      toast.error('Gagal membuka kembali periode', err instanceof Error ? err.message : undefined);
+    } finally {
+      setReopening(false);
     }
   }
 
@@ -100,24 +122,15 @@ export function ArchiveView({
   const isOwner = user.role === 'Owner';
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <div>
         <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">
-          Arsip Bulanan & Perbandingan Periode
+          Arsip Bulanan &amp; Tutup Periode
         </h1>
         <p className="text-sm text-slate-500 mt-0.5">
-          Data bulan lama tidak pernah dihapus saat pergantian bulan (Asia/Jakarta).
+          Data bulan lama disimpan permanen berdasarkan zona waktu Asia/Jakarta (WIB).
         </p>
       </div>
-
-      {feedback && (
-        <div className="px-4 py-3 bg-white border border-slate-200 rounded-lg text-sm text-slate-800 flex justify-between items-center">
-          <span>{feedback}</span>
-          <button type="button" onClick={() => setFeedback(null)} className="text-slate-400 cursor-pointer">
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-      )}
 
       {/* Month Comparison Panel */}
       {archives.length >= 2 && periodA && periodB && (
@@ -131,7 +144,9 @@ export function ArchiveView({
                 className="px-2.5 py-1.5 border border-slate-200 rounded-lg bg-white font-mono"
               >
                 {archives.map((a) => (
-                  <option key={a.id} value={a.id}>{a.period_key}</option>
+                  <option key={a.id} value={a.id}>
+                    {a.period_key}
+                  </option>
                 ))}
               </select>
               <span className="text-slate-400">vs</span>
@@ -141,42 +156,53 @@ export function ArchiveView({
                 className="px-2.5 py-1.5 border border-slate-200 rounded-lg bg-white font-mono"
               >
                 {archives.map((a) => (
-                  <option key={a.id} value={a.id}>{a.period_key}</option>
+                  <option key={a.id} value={a.id}>
+                    {a.period_key}
+                  </option>
                 ))}
               </select>
             </div>
           </div>
 
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-xs">
-            <div className="border border-slate-200 rounded-lg p-3">
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3.5 text-xs">
+            <div className="bg-slate-50 border border-slate-200/80 rounded-lg p-3.5">
               <div className="text-slate-500">Total Chapter</div>
-              <div className="font-mono tabular-nums text-base font-semibold mt-1">
-                {periodA.total_chapters} <span className="text-slate-400 font-normal">vs</span> {periodB.total_chapters}
+              <div className="font-mono tabular-nums text-base font-semibold text-slate-900 mt-1">
+                {periodA.total_chapters} <span className="text-slate-400 font-normal">vs</span>{' '}
+                {periodB.total_chapters}
               </div>
-              <div className="text-slate-500 mt-0.5 font-mono">
+              <div
+                className={`mt-1 font-mono tabular-nums ${
+                  periodA.total_chapters - periodB.total_chapters >= 0
+                    ? 'text-emerald-700'
+                    : 'text-rose-700'
+                }`}
+              >
                 Selisih: {periodA.total_chapters - periodB.total_chapters >= 0 ? '+' : ''}
                 {periodA.total_chapters - periodB.total_chapters}
               </div>
             </div>
-            <div className="border border-slate-200 rounded-lg p-3">
+            <div className="bg-slate-50 border border-slate-200/80 rounded-lg p-3.5">
               <div className="text-slate-500">Total Payroll</div>
-              <div className="font-mono tabular-nums text-sm font-semibold mt-1">
+              <div className="font-mono tabular-nums text-sm font-semibold text-slate-900 mt-1">
                 {formatIdr(periodA.total_payroll_idr)}
               </div>
-              <div className="text-slate-500 mt-0.5 font-mono">
+              <div className="text-slate-500 mt-1 font-mono tabular-nums">
                 vs {formatIdr(periodB.total_payroll_idr)}
               </div>
             </div>
-            <div className="border border-slate-200 rounded-lg p-3">
+            <div className="bg-slate-50 border border-slate-200/80 rounded-lg p-3.5">
               <div className="text-slate-500">Karyawan Aktif</div>
-              <div className="font-mono tabular-nums text-base font-semibold mt-1">
-                {periodA.active_workers} <span className="text-slate-400 font-normal">vs</span> {periodB.active_workers}
+              <div className="font-mono tabular-nums text-base font-semibold text-slate-900 mt-1">
+                {periodA.active_workers} <span className="text-slate-400 font-normal">vs</span>{' '}
+                {periodB.active_workers}
               </div>
             </div>
-            <div className="border border-slate-200 rounded-lg p-3">
+            <div className="bg-slate-50 border border-slate-200/80 rounded-lg p-3.5">
               <div className="text-slate-500">Komik Dikerjakan</div>
-              <div className="font-mono tabular-nums text-base font-semibold mt-1">
-                {periodA.total_comics} <span className="text-slate-400 font-normal">vs</span> {periodB.total_comics}
+              <div className="font-mono tabular-nums text-base font-semibold text-slate-900 mt-1">
+                {periodA.total_comics} <span className="text-slate-400 font-normal">vs</span>{' '}
+                {periodB.total_comics}
               </div>
             </div>
           </div>
@@ -185,31 +211,29 @@ export function ArchiveView({
 
       {/* Monthly Archive Cards */}
       {loading ? (
-        <div className="text-sm text-slate-400 py-8">Memuat arsip bulanan...</div>
+        <CardSkeletonGrid count={3} />
+      ) : archives.length === 0 ? (
+        <EmptyState
+          icon={<Archive className="w-5 h-5" />}
+          title="Belum ada arsip periode"
+          description="Periode bulanan dibuat otomatis saat laporan pertama masuk."
+        />
       ) : (
         <div className="space-y-4">
           {archives.map((arc) => (
             <div key={arc.id} className="bg-white border border-slate-200 rounded-xl p-5 space-y-4">
-              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 border-b border-slate-100 pb-3">
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 border-b border-slate-100 pb-3.5">
                 <div>
-                  <div className="flex items-center gap-3">
+                  <div className="flex flex-wrap items-center gap-2.5">
                     <h3 className="text-lg font-semibold font-mono text-slate-900">{arc.period_key}</h3>
-                    <span
-                      className={`text-xs font-medium ${
-                        arc.status === 'CLOSED'
-                          ? 'text-slate-700'
-                          : arc.status === 'REOPENED'
-                            ? 'text-amber-700'
-                            : 'text-emerald-700'
-                      }`}
-                    >
-                      {arc.status}
-                    </span>
+                    <StatusBadge status={arc.status} />
                   </div>
-                  <div className="text-xs text-slate-500 mt-0.5">
-                    Dibuka: {formatJakartaDateTime(arc.opened_at)}
-                    {arc.closed_at && ` · Ditutup: ${formatJakartaDateTime(arc.closed_at)} oleh ${arc.closed_by}`}
-                    {arc.reopened_at && ` · Dibuka kembali: ${formatJakartaDateTime(arc.reopened_at)} (${arc.reopen_reason})`}
+                  <div className="text-xs text-slate-500 mt-1 font-mono">
+                    Dibuka: {formatJakartaDateTime(arc.opened_at)} WIB
+                    {arc.closed_at &&
+                      ` · Ditutup: ${formatJakartaDateTime(arc.closed_at)} WIB oleh ${arc.closed_by}`}
+                    {arc.reopened_at &&
+                      ` · Dibuka kembali: ${formatJakartaDateTime(arc.reopened_at)} WIB (${arc.reopen_reason})`}
                   </div>
                 </div>
 
@@ -217,15 +241,16 @@ export function ArchiveView({
                   <button
                     type="button"
                     onClick={() => void downloadExportFile('payroll', 'xlsx', arc.id)}
-                    className="px-3 py-1.5 text-xs font-medium bg-white border border-slate-200 hover:bg-slate-50 rounded-lg cursor-pointer"
+                    className="px-3 py-1.5 text-xs font-medium bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
                   >
-                    Export Excel
+                    <FileSpreadsheet className="w-3.5 h-3.5" />
+                    <span>Export Excel</span>
                   </button>
                   {canAdmin && arc.status !== 'CLOSED' && (
                     <button
                       type="button"
-                      onClick={() => void handleClosePeriod(arc)}
-                      className="px-3 py-1.5 text-xs font-medium bg-slate-900 hover:bg-slate-800 text-white rounded-lg flex items-center gap-1.5 cursor-pointer"
+                      onClick={() => setCloseTarget(arc)}
+                      className="px-3 py-1.5 text-xs font-medium bg-slate-900 hover:bg-slate-800 text-white rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
                     >
                       <Lock className="w-3.5 h-3.5" /> Tutup Periode
                     </button>
@@ -233,8 +258,11 @@ export function ArchiveView({
                   {isOwner && arc.status === 'CLOSED' && (
                     <button
                       type="button"
-                      onClick={() => { setReopenTarget(arc); setReopenReason(''); }}
-                      className="px-3 py-1.5 text-xs font-medium bg-amber-700 hover:bg-amber-800 text-white rounded-lg flex items-center gap-1.5 cursor-pointer"
+                      onClick={() => {
+                        setReopenTarget(arc);
+                        setReopenReason('');
+                      }}
+                      className="px-3 py-1.5 text-xs font-medium bg-amber-700 hover:bg-amber-800 text-white rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
                     >
                       <Unlock className="w-3.5 h-3.5" /> Buka Kembali (Owner)
                     </button>
@@ -242,27 +270,31 @@ export function ArchiveView({
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-3 text-xs">
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3.5 text-xs">
                 <div>
                   <div className="text-slate-500">Karyawan</div>
-                  <div className="font-mono tabular-nums font-semibold text-sm mt-0.5">{arc.active_workers}</div>
+                  <div className="font-mono tabular-nums font-semibold text-sm text-slate-900 mt-0.5">
+                    {arc.active_workers}
+                  </div>
                 </div>
                 <div>
                   <div className="text-slate-500">Komik</div>
-                  <div className="font-mono tabular-nums font-semibold text-sm mt-0.5">{arc.total_comics}</div>
+                  <div className="font-mono tabular-nums font-semibold text-sm text-slate-900 mt-0.5">
+                    {arc.total_comics}
+                  </div>
                 </div>
                 <div>
                   <div className="text-slate-500">Total Chapter</div>
-                  <div className="font-mono tabular-nums font-semibold text-sm mt-0.5">
+                  <div className="font-mono tabular-nums font-semibold text-sm text-slate-900 mt-0.5">
                     {arc.total_chapters}
                   </div>
-                  <div className="text-slate-400 font-mono">
+                  <div className="text-slate-400 font-mono text-[11px]">
                     TL {arc.translator_chapters} · ED {arc.editor_chapters} · S {arc.solo_chapters}
                   </div>
                 </div>
                 <div>
                   <div className="text-slate-500">Total Payroll</div>
-                  <div className="font-mono tabular-nums font-semibold text-sm mt-0.5">
+                  <div className="font-mono tabular-nums font-semibold text-sm text-slate-900 mt-0.5">
                     {formatIdr(arc.total_payroll_idr)}
                   </div>
                 </div>
@@ -281,11 +313,14 @@ export function ArchiveView({
               </div>
 
               {arc.byComic.length > 0 && (
-                <div className="pt-2 border-t border-slate-100">
-                  <div className="text-xs font-medium text-slate-600 mb-1.5">Pengeluaran per Komik</div>
-                  <div className="flex flex-wrap gap-x-5 gap-y-1 text-xs text-slate-700 font-mono tabular-nums">
+                <div className="pt-3 border-t border-slate-100">
+                  <div className="text-xs font-medium text-slate-600 mb-2">Pengeluaran per Komik</div>
+                  <div className="flex flex-wrap gap-2 text-xs font-mono tabular-nums">
                     {arc.byComic.map((c) => (
-                      <span key={c.title}>
+                      <span
+                        key={c.title}
+                        className="px-2.5 py-1 bg-slate-50 border border-slate-200/80 rounded-md text-slate-700"
+                      >
                         {c.title}: {c.chapters} ch ({formatIdr(c.amount_idr)})
                       </span>
                     ))}
@@ -297,23 +332,42 @@ export function ArchiveView({
         </div>
       )}
 
+      {/* Confirm Close Period Modal */}
+      <ConfirmModal
+        open={Boolean(closeTarget)}
+        title={`Tutup Periode ${closeTarget?.period_key}?`}
+        description="Setelah ditutup (CLOSED), pembayaran langsung dan perubahan otomatis dari edit pesan Discord akan dikunci. Hanya Owner yang dapat membuka kembali periode."
+        confirmLabel="Ya, Tutup Periode"
+        variant="warning"
+        loading={closing}
+        onConfirm={confirmClosePeriod}
+        onCancel={() => setCloseTarget(null)}
+      />
+
+      {/* Reopen Modal (Owner) */}
       {reopenTarget && (
-        <div className="fixed inset-0 z-50 bg-slate-900/40 flex items-center justify-center p-4">
-          <div className="bg-white border border-slate-200 rounded-xl w-full max-w-md p-6">
-            <div className="flex items-center justify-between mb-4">
+        <div className="fixed inset-0 z-50 bg-slate-900/45 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-xl w-full max-w-md p-6 shadow-xl">
+            <div className="flex items-center justify-between mb-3">
               <h2 className="text-lg font-semibold text-slate-900">
                 Buka Kembali Periode {reopenTarget.period_key}
               </h2>
-              <button type="button" onClick={() => setReopenTarget(null)} className="text-slate-400 cursor-pointer">
+              <button
+                type="button"
+                onClick={() => setReopenTarget(null)}
+                className="text-slate-400 hover:text-slate-700 cursor-pointer"
+              >
                 <X className="w-5 h-5" />
               </button>
             </div>
-            <p className="text-xs text-slate-500 mb-4">
-              Tindakan khusus Owner ini akan dicatat di audit log beserta alasannya.
+            <p className="text-xs text-slate-500 mb-4 leading-relaxed">
+              Tindakan khusus Owner ini akan dicatat permanen di audit log beserta alasannya.
             </p>
             <form onSubmit={submitReopen} className="space-y-4">
               <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">Alasan Pembukaan Kembali (Wajib)</label>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  Alasan Pembukaan Kembali (Wajib)
+                </label>
                 <input
                   type="text"
                   required
@@ -323,9 +377,22 @@ export function ArchiveView({
                   placeholder="Misal: Koreksi laporan tertinggal sebelum tutup buku"
                 />
               </div>
-              <div className="flex justify-end gap-2">
-                <button type="button" onClick={() => setReopenTarget(null)} className="px-4 py-2 text-sm text-slate-700 cursor-pointer">Batal</button>
-                <button type="submit" className="px-4 py-2 text-sm font-medium bg-amber-700 text-white rounded-lg cursor-pointer">Buka Periode</button>
+              <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => setReopenTarget(null)}
+                  className="px-4 py-2 text-sm text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg cursor-pointer"
+                >
+                  Batal
+                </button>
+                <button
+                  type="submit"
+                  disabled={reopening}
+                  className="px-4 py-2 text-sm font-medium bg-amber-700 hover:bg-amber-800 text-white rounded-lg inline-flex items-center gap-2 cursor-pointer disabled:opacity-60"
+                >
+                  {reopening && <Loader2 className="w-4 h-4 animate-spin" />}
+                  <span>Buka Periode</span>
+                </button>
               </div>
             </form>
           </div>

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, notInArray, sql } from 'drizzle-orm';
 import { createTestPgDb, seedGuildDefaults } from '../server/db.ts';
 import { formatReportAcceptedMessage } from '../server/discordBot.ts';
 import { parseDiscordReport } from '../server/parser.ts';
@@ -894,7 +894,7 @@ async function runTests() {
           'total chapter : 1',
           '',
           'Laporan Kamu : Pending',
-          'pesan : Chapter duplikat terdeteksi (Ch. 6) sudah pernah dilaporkan sebelumnya.',
+          'pesan : Chapter duplikat untuk komik "Prabowo 3 Periode" (Role: Translator) pada Ch. 6 — sudah tercatat sebelumnya oleh Pelapor TL (Status: Disetujui).',
         ].join('\n')
       );
 
@@ -934,6 +934,180 @@ async function runTests() {
           'pesan : Role pekerjaan (ETL/Translator, TS/Editor, atau Solo) tidak dikenali.',
         ].join('\n')
       );
+    });
+
+    await test('21. Smart Duplicate Logic Matrix (Cross-Reporter, Range Overlap, Different Role, Different Chapter, Edit & Delete)', async () => {
+      const fileTlChannelId = '1352988212079104031';
+
+      // Baseline: Worker A reports "Nano Machine" Ch 4 as Translator (ETL) -> APPROVED
+      const baseRes = await processDiscordReport(db, {
+        discordMessageId: '900000000000000401',
+        discordGuildId: guild.discordGuildId,
+        discordChannelId: fileTlChannelId,
+        discordChannelName: 'file-tl',
+        discordAuthorId: '770000000000000701',
+        authorUsername: 'worker_a',
+        authorDisplayName: 'Worker A',
+        content: '<#1352988212079104031> Nano Machine CH 04 ETL Done',
+        mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
+      });
+      assert.equal(baseRes.outcome, 'PROCESSED');
+      assert.equal(baseRes.isPending, false);
+      assert.equal(baseRes.approvalStatus, 'approved');
+
+      // Case 1: Same comic + Same role + Same chapter by DIFFERENT reporter (Worker B) -> PENDING
+      const crossUserDup = await processDiscordReport(db, {
+        discordMessageId: '900000000000000402',
+        discordGuildId: guild.discordGuildId,
+        discordChannelId: fileTlChannelId,
+        discordChannelName: 'file-tl',
+        discordAuthorId: '770000000000000702',
+        authorUsername: 'worker_b',
+        authorDisplayName: 'Worker B',
+        content: '<#1352988212079104031> nano-machine CH 4 TL Done',
+        mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
+      });
+      assert.equal(crossUserDup.outcome, 'PROCESSED');
+      assert.equal(crossUserDup.isPending, true);
+      assert.equal(crossUserDup.approvalStatus, 'pending');
+      assert.equal(crossUserDup.totalAmountIdr, 0);
+      assert.ok(crossUserDup.pendingReason?.includes('Nano Machine'));
+      assert.ok(crossUserDup.pendingReason?.includes('Translator'));
+      assert.ok(crossUserDup.pendingReason?.includes('Ch. 4'));
+      assert.ok(crossUserDup.pendingReason?.includes('Worker A'));
+
+      // Case 2: Same comic + Same role + OVERLAPPING RANGE (CH 4-5 where 4 is taken, 5 is free) -> PENDING
+      const rangeOverlap = await processDiscordReport(db, {
+        discordMessageId: '900000000000000403',
+        discordGuildId: guild.discordGuildId,
+        discordChannelId: fileTlChannelId,
+        discordChannelName: 'file-tl',
+        discordAuthorId: '770000000000000703',
+        authorUsername: 'worker_c',
+        authorDisplayName: 'Worker C',
+        content: '<#1352988212079104031> Nano Machine CH 4-5 ETL Done',
+        mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
+      });
+      assert.equal(rangeOverlap.outcome, 'PROCESSED');
+      assert.equal(rangeOverlap.isPending, true);
+      assert.equal(rangeOverlap.approvalStatus, 'pending');
+      assert.equal(rangeOverlap.totalAmountIdr, 0);
+      assert.ok(rangeOverlap.pendingReason?.includes('Ch. 4'));
+      assert.ok(rangeOverlap.pendingReason?.includes('Worker A'));
+
+      // Reject the pending overlap report so Ch. 5 is NOT blocked by pending record
+      const overlapChapters = await db
+        .select({ id: reportChapters.id })
+        .from(reportChapters)
+        .where(eq(reportChapters.reportId, rangeOverlap.reportId!));
+      await updateChapterApproval(
+        db,
+        overlapChapters.map((c) => c.id),
+        'reject',
+        adminActor,
+        'Overlap ditolak'
+      );
+
+      // Case 3: Same comic + DIFFERENT role (Editor / TS) + Same chapter (CH 4) -> APPROVED
+      const diffRole = await processDiscordReport(db, {
+        discordMessageId: '900000000000000404',
+        discordGuildId: guild.discordGuildId,
+        discordChannelId: fileTlChannelId,
+        discordChannelName: 'file-tl',
+        discordAuthorId: '770000000000000702',
+        authorUsername: 'worker_b',
+        authorDisplayName: 'Worker B',
+        content: '<#1352988212079104031> Nano Machine CH 04 TS Done',
+        mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
+      });
+      assert.equal(diffRole.outcome, 'PROCESSED');
+      assert.equal(diffRole.isPending, false);
+      assert.equal(diffRole.approvalStatus, 'approved');
+
+      // Case 4: Same comic + Same role (Translator) + DIFFERENT chapter (CH 5, after overlap was rejected) -> APPROVED
+      const diffChapter = await processDiscordReport(db, {
+        discordMessageId: '900000000000000405',
+        discordGuildId: guild.discordGuildId,
+        discordChannelId: fileTlChannelId,
+        discordChannelName: 'file-tl',
+        discordAuthorId: '770000000000000703',
+        authorUsername: 'worker_c',
+        authorDisplayName: 'Worker C',
+        content: '<#1352988212079104031> Nano Machine CH 05 ETL Done',
+        mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
+      });
+      assert.equal(diffChapter.outcome, 'PROCESSED');
+      assert.equal(diffChapter.isPending, false);
+      assert.equal(diffChapter.approvalStatus, 'approved');
+
+      // Case 5: Edit own message does NOT block itself, whereas editing to collide with Ch. 4 flags pending
+      const selfEdit = await handleDiscordMessageEdit(db, {
+        discordMessageId: '900000000000000405',
+        discordGuildId: guild.discordGuildId,
+        discordChannelId: fileTlChannelId,
+        discordChannelName: 'file-tl',
+        discordAuthorId: '770000000000000703',
+        authorUsername: 'worker_c',
+        authorDisplayName: 'Worker C',
+        content: '<#1352988212079104031> Nano Machine CH 5-6 ETL Done',
+        mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
+      });
+      assert.equal(selfEdit.status, 'EDITED_SYNCED');
+      const afterSelfEditChapters = await db
+        .select()
+        .from(reportChapters)
+        .where(
+          and(
+            eq(reportChapters.reportId, diffChapter.reportId!),
+            notInArray(reportChapters.approvalStatus, ['void'])
+          )
+        );
+      assert.equal(afterSelfEditChapters.length, 2);
+      assert.ok(afterSelfEditChapters.every((c) => c.approvalStatus === 'auto_approved'));
+
+      // Edit to collide with Ch. 4 (already reported by Worker A) -> routed to pending with duplicateFlag=true on Ch. 4
+      await handleDiscordMessageEdit(db, {
+        discordMessageId: '900000000000000405',
+        discordGuildId: guild.discordGuildId,
+        discordChannelId: fileTlChannelId,
+        discordChannelName: 'file-tl',
+        discordAuthorId: '770000000000000703',
+        authorUsername: 'worker_c',
+        authorDisplayName: 'Worker C',
+        content: '<#1352988212079104031> Nano Machine CH 4-5 ETL Done',
+        mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
+      });
+      const afterCollideChapters = await db
+        .select()
+        .from(reportChapters)
+        .where(
+          and(
+            eq(reportChapters.reportId, diffChapter.reportId!),
+            notInArray(reportChapters.approvalStatus, ['void'])
+          )
+        );
+      assert.ok(afterCollideChapters.every((c) => c.approvalStatus === 'pending'));
+      assert.ok(afterCollideChapters.some((c) => c.chapterNumber === 4 && c.duplicateFlag === true));
+
+      // Case 6: Delete Worker A's report (CH 4) and void Worker B/C pending -> new Ch. 4 report succeeds
+      await handleDiscordMessageDelete(db, '900000000000000401', adminActor, 'Hapus laporan awal');
+      await handleDiscordMessageDelete(db, '900000000000000402', adminActor, 'Hapus duplikat');
+      await handleDiscordMessageDelete(db, '900000000000000405', adminActor, 'Hapus konflik edit');
+
+      const freshAfterDelete = await processDiscordReport(db, {
+        discordMessageId: '900000000000000406',
+        discordGuildId: guild.discordGuildId,
+        discordChannelId: fileTlChannelId,
+        discordChannelName: 'file-tl',
+        discordAuthorId: '770000000000000704',
+        authorUsername: 'worker_d',
+        authorDisplayName: 'Worker D',
+        content: '<#1352988212079104031> Nano Machine CH 04 ETL Done',
+        mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
+      });
+      assert.equal(freshAfterDelete.outcome, 'PROCESSED');
+      assert.equal(freshAfterDelete.isPending, false);
+      assert.equal(freshAfterDelete.approvalStatus, 'approved');
     });
 
     console.log(`\nALL ${passed} CORE POSTGRESQL & PAYROLL TEST SUITES PASSED.`);
