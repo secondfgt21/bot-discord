@@ -3,6 +3,7 @@ import { ensurePeriodExists, seedGuildDefaults, type AppDb } from './db.ts';
 import {
   parseDiscordReport,
   type ChannelMappingEntry,
+  type GuildChannelMappingEntry,
   type ProjectCatalogEntry,
   type RoleAliasEntry,
 } from './parser.ts';
@@ -28,7 +29,7 @@ import {
   roleAliases,
 } from './schema.ts';
 import { formatIdr, getJakartaDateParts } from './time.ts';
-import type { AuthUser, IncomingDiscordMessage, RoleName } from './types.ts';
+import type { AuthUser, IncomingDiscordMessage, ParsedReportResult, RoleName } from './types.ts';
 
 export async function writeAuditLog(
   db: AppDb,
@@ -124,31 +125,43 @@ async function loadParserCatalog(
   discordChannelId: string
 ): Promise<{
   isReportChannel: boolean;
+  currentChannelName: string | null;
   projects: ProjectCatalogEntry[];
   channelMappings: ChannelMappingEntry[];
+  guildChannelMappings: GuildChannelMappingEntry[];
   roleAliases: RoleAliasEntry[];
 }> {
-  const channelRows = await db
+  const allGuildChannelRows = await db
     .select({
+      discordChannelId: channelMappings.discordChannelId,
+      channelName: channelMappings.channelName,
       projectId: channelMappings.projectId,
       isReportChannel: channelMappings.isReportChannel,
       isDefault: channelMappings.isDefault,
     })
     .from(channelMappings)
-    .where(
-      and(
-        eq(channelMappings.guildId, guildId),
-        eq(channelMappings.discordChannelId, discordChannelId)
-      )
-    );
+    .where(eq(channelMappings.guildId, guildId));
+
+  const channelRows = allGuildChannelRows.filter(
+    (r) => r.discordChannelId === discordChannelId
+  );
 
   const isReportChannel = channelRows.some((r) => r.isReportChannel);
+  const currentChannelName =
+    channelRows.find((r) => r.channelName?.trim())?.channelName?.trim() ?? null;
   const mappedChannels: ChannelMappingEntry[] = channelRows
     .filter((r) => r.projectId !== null)
     .map((r) => ({
       projectId: r.projectId as string,
       isDefault: r.isDefault,
     }));
+
+  const guildChannelMappingsList: GuildChannelMappingEntry[] = allGuildChannelRows.map((r) => ({
+    discordChannelId: r.discordChannelId,
+    channelName: r.channelName,
+    projectId: r.projectId,
+    isDefault: r.isDefault,
+  }));
 
   const projectRows = await db
     .select({ id: projects.id, title: projects.title })
@@ -180,10 +193,82 @@ async function loadParserCatalog(
 
   return {
     isReportChannel,
+    currentChannelName,
     projects: projectCatalog,
     channelMappings: mappedChannels,
+    guildChannelMappings: guildChannelMappingsList,
     roleAliases: roleAliasRows.map((r) => ({ alias: r.alias, role: r.role as RoleName })),
   };
+}
+
+async function resolveOrCreateAutoProject(
+  db: AppDb,
+  guildId: string,
+  parsed: ParsedReportResult
+): Promise<void> {
+  if (!parsed.isReport || parsed.projectId || parsed.chapters.length === 0 || !parsed.role) {
+    return;
+  }
+
+  const candidateTitle = parsed.extractedTitle?.trim() || '';
+  if (!candidateTitle) {
+    return;
+  }
+
+  const derivedSlug = candidateTitle
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+
+  if (!derivedSlug) {
+    return;
+  }
+
+  const existingProj = await db
+    .select()
+    .from(projects)
+    .where(and(eq(projects.guildId, guildId), eq(projects.slug, derivedSlug)))
+    .limit(1);
+
+  let targetProject = existingProj[0];
+  if (!targetProject) {
+    const inserted = await db
+      .insert(projects)
+      .values({
+        guildId,
+        title: candidateTitle,
+        slug: derivedSlug,
+        isActive: true,
+      })
+      .onConflictDoNothing()
+      .returning();
+    targetProject = inserted[0];
+
+    if (!targetProject) {
+      const refetched = await db
+        .select()
+        .from(projects)
+        .where(and(eq(projects.guildId, guildId), eq(projects.slug, derivedSlug)))
+        .limit(1);
+      targetProject = refetched[0];
+    }
+  }
+
+  if (targetProject) {
+    parsed.projectId = targetProject.id;
+    parsed.projectTitleMatched = targetProject.title;
+    parsed.extractedTitle = targetProject.title;
+    parsed.parseNotes = parsed.parseNotes.filter(
+      (n) =>
+        !n.includes('tidak ditemukan') &&
+        !n.includes('belum di-mapping') &&
+        !n.includes('belum terdaftar') &&
+        !n.includes('perlu pemeriksaan')
+    );
+    if (parsed.parseStatus === 'AMBIGUOUS_PROJECT') {
+      parsed.parseStatus = parsed.workStatus ? 'VALID' : 'UNKNOWN_STATUS';
+    }
+  }
 }
 
 export async function recalculatePayrollForMemberPeriod(
@@ -422,6 +507,10 @@ export async function processDiscordReport(
     | 'PROCESSED';
   reportId?: string;
   parseStatus?: string;
+  projectTitle?: string | null;
+  chapterDisplay?: string;
+  chapters?: number[];
+  totalChapters?: number;
   chaptersCreated?: number;
   totalAmountIdr?: number;
   approvalSummary?: string;
@@ -456,63 +545,15 @@ export async function processDiscordReport(
   const parsed = parseDiscordReport(msg.content, {
     projects: catalog.projects,
     channelMappings: catalog.channelMappings,
+    guildChannelMappings: catalog.guildChannelMappings,
     roleAliases: catalog.roleAliases,
     explicitMentions: msg.mentions,
+    mentionedChannels: msg.mentionedChannels,
+    currentChannelId: msg.discordChannelId,
+    currentChannelName: msg.discordChannelName ?? catalog.currentChannelName,
   });
 
-  if (parsed.isReport && !parsed.projectId && parsed.chapters.length > 0 && parsed.role) {
-  const rawTitleCandidate = (parsed.projectTitleMatched || parsed.cleanedContent.split(/\b(?:chapter|chap|ch)\b/i)[0] || '')
-    .replace(/^#/, '')
-    .replace(/[_-]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  const derivedTitle = rawTitleCandidate || `Channel ${msg.discordChannelId}`;
-  const derivedSlug =
-    derivedTitle
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '') || `project-${Date.now()}`;
-
-  const existingProj = await db
-    .select()
-    .from(projects)
-    .where(and(eq(projects.guildId, guild.id), eq(projects.slug, derivedSlug)))
-    .limit(1);
-
-  let targetProject = existingProj[0];
-  if (!targetProject) {
-    const inserted = await db
-      .insert(projects)
-      .values({
-        guildId: guild.id,
-        title: derivedTitle,
-        slug: derivedSlug,
-        isActive: true,
-      })
-      .returning();
-    targetProject = inserted[0];
-  }
-
-  if (targetProject) {
-    parsed.projectId = targetProject.id;
-    parsed.projectTitleMatched = targetProject.title;
-    parsed.parseStatus = 'VALID';
-    parsed.parseNotes = parsed.parseNotes.filter(
-      (n) => !n.includes('tidak ditemukan') && !n.includes('belum di-mapping') && !n.includes('perlu pemeriksaan')
-    );
-
-    await db
-      .update(channelMappings)
-      .set({ projectId: targetProject.id, updatedAt: new Date() })
-      .where(
-        and(
-          eq(channelMappings.guildId, guild.id),
-          eq(channelMappings.discordChannelId, msg.discordChannelId),
-          sql`${channelMappings.projectId} IS NULL`
-        )
-      );
-  }
-}
+  await resolveOrCreateAutoProject(db, guild.id, parsed);
 
   if (!parsed.isReport) {
     return { outcome: 'IGNORED_NOT_A_REPORT' };
@@ -603,11 +644,12 @@ export async function processDiscordReport(
       }
 
       const isCleanAutoApprove =
-      !periodIsClosed &&
-      !duplicateFlag &&
-      chNum > 0 &&
-      parsed.role !== null &&
-      parsed.projectId !== null;
+        parsed.parseStatus !== 'PROJECT_CHANNEL_CONFLICT' &&
+        !periodIsClosed &&
+        !duplicateFlag &&
+        chNum > 0 &&
+        parsed.role !== null &&
+        parsed.projectId !== null;
 
       const approvalStatus = isCleanAutoApprove ? 'auto_approved' : 'pending';
       const amount = parsed.role && chNum > 0 ? unitRate : 0;
@@ -701,6 +743,10 @@ export async function processDiscordReport(
       outcome: 'PROCESSED' as const,
       reportId: createdReport.id,
       parseStatus: parsed.parseStatus,
+      projectTitle: parsed.projectTitleMatched ?? parsed.extractedTitle ?? null,
+      chapterDisplay: parsed.chapterDisplay,
+      chapters: parsed.chapters,
+      totalChapters: parsed.chapters.length,
       chaptersCreated: chaptersToInsert.length,
       totalAmountIdr,
       approvalSummary:
@@ -738,9 +784,15 @@ export async function handleDiscordMessageEdit(
   const parsed = parseDiscordReport(msg.content, {
     projects: catalog.projects,
     channelMappings: catalog.channelMappings,
+    guildChannelMappings: catalog.guildChannelMappings,
     roleAliases: catalog.roleAliases,
     explicitMentions: msg.mentions,
+    mentionedChannels: msg.mentionedChannels,
+    currentChannelId: msg.discordChannelId,
+    currentChannelName: msg.discordChannelName ?? catalog.currentChannelName,
   });
+
+  await resolveOrCreateAutoProject(db, existing.guildId, parsed);
 
   const oldChapters = await db
     .select({

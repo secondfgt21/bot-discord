@@ -11,6 +11,18 @@ export interface ChannelMappingEntry {
   isDefault: boolean;
 }
 
+export interface GuildChannelMappingEntry {
+  discordChannelId: string;
+  channelName: string;
+  projectId: string | null;
+  isDefault: boolean;
+}
+
+export interface MentionedChannelInfo {
+  id: string;
+  name: string;
+}
+
 export interface RoleAliasEntry {
   alias: string;
   role: RoleName;
@@ -25,34 +37,149 @@ const VALID_WORK_STATUSES = new Set([
   'selesai',
 ]);
 
+// Generic/utility channels (like #file-tl) that must NEVER be treated as a comic title
+export const NON_COMIC_CHANNEL_IDS = new Set<string>([
+  '1352988212079104031', // #file-tl
+]);
+
+const NON_COMIC_CHANNEL_NAMES = new Set<string>([
+  'file-tl',
+  'file-ts',
+  'file-etl',
+  'file-editor',
+  'file-raw',
+  'file-clean',
+  'file-cl',
+  'file-pr',
+  'file-qc',
+  'file-solo',
+  'laporan',
+  'laporan-tl',
+  'laporan-ts',
+  'laporan-etl',
+  'laporan-kerja',
+  'laporan-chapter',
+  'report',
+  'reports',
+  'general',
+]);
+
 const MAX_EXPANDED_CHAPTERS = 200;
 
-function normalizeText(input: string): string {
+/**
+ * Strip invisible/zero-width/BOM characters (such as \uFEFF, \u200B, etc.)
+ * and normalize non-breaking spaces to regular spaces.
+ */
+export function stripInvisibleChars(input: string): string {
   return input
+    .replace(/[\uFEFF\u200B-\u200F\u202A-\u202E\u2060-\u206F\u00AD]/g, '')
+    .replace(/\u00A0/g, ' ');
+}
+
+export function isNonComicChannel(
+  channelId?: string | null,
+  channelName?: string | null
+): boolean {
+  if (channelId && NON_COMIC_CHANNEL_IDS.has(channelId.trim())) {
+    return true;
+  }
+  if (channelName) {
+    const slug = stripInvisibleChars(channelName)
+      .replace(/^#+/, '')
+      .trim()
+      .toLowerCase()
+      .replace(/[_\s]+/g, '-');
+    if (slug && NON_COMIC_CHANNEL_NAMES.has(slug)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Normalize a Discord channel name or hashtag slug into a readable comic title.
+ * Example: "#Solo-Leveling" -> "Solo Leveling", "#solo-leveling" -> "Solo Leveling".
+ */
+export function normalizeChannelNameToTitle(raw: string): string {
+  const cleaned = stripInvisibleChars(raw)
+    .replace(/^#+/, '')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return '';
+  if (cleaned === cleaned.toLowerCase()) {
+    return cleaned
+      .split(' ')
+      .map((w) => (w ? w.charAt(0).toUpperCase() + w.slice(1) : w))
+      .join(' ');
+  }
+  return cleaned;
+}
+
+/**
+ * Sanitize explicit comic title text extracted from a message:
+ * - Removes invisible/zero-width/BOM characters
+ * - Strips any residual Discord channel mentions (<#...>) and user/role mentions (<@...>, @user)
+ * - Strips trailing status clauses like ", ETL Done" if present
+ * - Trims dangling separators at start/end while preserving internal punctuation (e.g. ":")
+ */
+export function sanitizeTitleText(raw: string): string {
+  let text = stripInvisibleChars(raw)
+    .replace(/<#\d+>/g, ' ')
+    .replace(/<@[!&]?\d+>|@[A-Za-z0-9_.-]+/g, ' ')
+    .replace(
+      /(?:,\s*|\s+[-–—]\s+|\s+)(?:(?:etl|ts|tl|translator|editor|solo)\s+)?(?:done|completed|complete|finish|finished|selesai)\b.*$/i,
+      ''
+    )
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  text = text.replace(/^[\s\-–—,:;|/]+|[\s\-–—,:;|/]+$/g, '').trim();
+  return text;
+}
+
+function normalizeText(input: string): string {
+  return stripInvisibleChars(input)
     .toLowerCase()
     .replace(/[_-]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function matchesPattern(normalizedText: string, pattern: string): boolean {
+  if (!normalizedText || !pattern) return false;
+  if (normalizedText === pattern) return true;
+  // Short aliases (<= 3 chars, e.g. "SL", "NM", "ORV") require exact match to avoid false positives
+  if (pattern.length <= 3) return false;
+  const boundaryRegex = new RegExp(
+    `(?:^|[\\s,:;|/()\\[\\]])${escapeRegex(pattern)}(?:$|[\\s,:;|/()\\[\\]])`
+  );
+  return boundaryRegex.test(normalizedText);
+}
+
 /**
- * Extract mentions from Discord message syntax (<@123>, <@!123>, @Controller, @everyone, @here)
- * and return both extracted mention tokens and the text with mentions stripped.
+ * Extract user/role mentions from Discord message syntax (<@123>, <@!123>, <@&123>, @Controller)
+ * and return both extracted mention tokens and the text with invisible chars & mentions stripped.
  * CRITICAL: Mentioned users (@Controller) are NEVER treated as the worker.
  */
 export function extractAndStripMentions(
   rawContent: string,
   explicitMentions: string[] = []
 ): { mentions: string[]; stripped: string } {
+  const cleanRaw = stripInvisibleChars(rawContent);
   const found = new Set<string>(explicitMentions);
-  const mentionRegex = /<@!?\d+>|@[A-Za-z0-9_.-]+/g;
-  const matches = rawContent.match(mentionRegex);
+  const mentionRegex = /<@[!&]?\d+>|@[A-Za-z0-9_.-]+/g;
+  const matches = cleanRaw.match(mentionRegex);
   if (matches) {
     for (const m of matches) {
       found.add(m);
     }
   }
-  const stripped = rawContent.replace(mentionRegex, ' ').replace(/\s+/g, ' ').trim();
+  const stripped = cleanRaw.replace(mentionRegex, ' ').replace(/\s+/g, ' ').trim();
   return {
     mentions: Array.from(found),
     stripped,
@@ -60,51 +187,97 @@ export function extractAndStripMentions(
 }
 
 /**
- * Extract leading hashtags / channel references like #Solo-Leveling or #file-ts.
+ * Extract Discord channel mentions (<#channel_id>) anywhere in the message
+ * and leading hashtag channel references (#Solo-Leveling, #file-tl, etc.).
  */
-function extractLeadingChannelTags(text: string): {
+export function extractChannelReferences(text: string): {
+  mentionedChannelIds: string[];
   tags: string[];
   body: string;
 } {
+  const mentionedChannelIds: string[] = [];
+  const channelMentionRegex = /<#(\d+)>/g;
+  let match: RegExpExecArray | null;
+  while ((match = channelMentionRegex.exec(text)) !== null) {
+    if (!mentionedChannelIds.includes(match[1])) {
+      mentionedChannelIds.push(match[1]);
+    }
+  }
+
+  let remaining = text.replace(channelMentionRegex, ' ').replace(/\s+/g, ' ').trim();
+
   const tags: string[] = [];
-  let remaining = text.trim();
   const tagRegex = /^#([A-Za-z0-9_-]+)\s*/;
   while (true) {
-    const match = remaining.match(tagRegex);
-    if (!match) break;
-    tags.push(match[1]);
-    remaining = remaining.slice(match[0].length).trim();
+    const tagMatch = remaining.match(tagRegex);
+    if (!tagMatch) break;
+    tags.push(tagMatch[1]);
+    remaining = remaining.slice(tagMatch[0].length).trim();
   }
-  return { tags, body: remaining };
+
+  return {
+    mentionedChannelIds,
+    tags,
+    body: remaining,
+  };
+}
+
+function formatChapterDisplay(rawExpr: string | null, chapters: number[]): string {
+  if (rawExpr && rawExpr.trim()) {
+    return rawExpr
+      .trim()
+      .replace(/\b(?:sampai|to|s\/d|sd)\b/gi, '-')
+      .replace(/\s*[-–—]\s*/g, '-')
+      .replace(/\s*,\s*/g, ', ')
+      .replace(/\s*&\s*/g, ', ')
+      .replace(/\s+\bdan\b\s+/gi, ', ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+  if (chapters.length === 0) return '-';
+  if (chapters.length === 1) return String(chapters[0]);
+  let isContiguous = true;
+  for (let i = 1; i < chapters.length; i++) {
+    if (chapters[i] !== chapters[i - 1] + 1) {
+      isContiguous = false;
+      break;
+    }
+  }
+  if (isContiguous) {
+    return `${chapters[0]}-${chapters[chapters.length - 1]}`;
+  }
+  return chapters.join(', ');
 }
 
 /**
  * Deterministic chapter extractor and inclusive range expander.
  * Supports:
- * - CH 18, ch 18, Ch 18, Chapter 18, chapter 18, CH108
- * - CH 108-110, CH 108 - 110, Chapter 108 sampai 110
+ * - CH 08, CH 18, ch 18, Ch 18, Chapter 18, chapter 18, CH108
+ * - CH 4-5, CH 108-110, CH 108 - 110, Chapter 108 sampai 110
  * - CH 108, 109, 110, CH 108 & 109
  * - CH 108-110, 115, 118-120
  */
 export function parseChapterSegment(text: string): {
   foundChapterKeyword: boolean;
   chapters: number[];
+  rawChapterExpr: string | null;
+  chapterDisplay: string;
   invalidReason: string | null;
   chapterMatchStart: number;
   chapterMatchEnd: number;
 } {
-  // Match keyword (chapter / ch) followed by numbers, ranges, commas, &, sampai/to/sd
   const chapterClauseRegex =
     /\b(?:chapter|chap|ch)\s*\.?\s*([+-]?\d+(?:\s*(?:-|–|—|sampai|to|s\/d|sd|,|&|\bdan\b)\s*[+-]?\d+)*)/i;
   const match = text.match(chapterClauseRegex);
 
   if (!match || match.index === undefined) {
-    // Check if keyword exists with invalid non-numeric value like "CH abc"
     const brokenMatch = text.match(/\b(?:chapter|chap|ch)\s*\.?\s*([a-zA-Z-]+)/i);
     if (brokenMatch && brokenMatch.index !== undefined) {
       return {
         foundChapterKeyword: true,
         chapters: [],
+        rawChapterExpr: null,
+        chapterDisplay: '-',
         invalidReason: `Chapter tidak valid dekat "${brokenMatch[0]}"`,
         chapterMatchStart: brokenMatch.index,
         chapterMatchEnd: brokenMatch.index + brokenMatch[0].length,
@@ -113,6 +286,8 @@ export function parseChapterSegment(text: string): {
     return {
       foundChapterKeyword: false,
       chapters: [],
+      rawChapterExpr: null,
+      chapterDisplay: '-',
       invalidReason: null,
       chapterMatchStart: -1,
       chapterMatchEnd: -1,
@@ -135,7 +310,6 @@ export function parseChapterSegment(text: string): {
   const orderedChapters: number[] = [];
 
   for (const part of parts) {
-    // Check if it's a range (note: watch out for negative numbers like -5)
     const rangeMatch = part.match(/^([+-]?\d+)\s*-\s*([+-]?\d+)$/);
     if (rangeMatch) {
       const start = Number(rangeMatch[1]);
@@ -144,6 +318,8 @@ export function parseChapterSegment(text: string): {
         return {
           foundChapterKeyword: true,
           chapters: [],
+          rawChapterExpr: null,
+          chapterDisplay: '-',
           invalidReason: `Nomor chapter harus bilangan bulat positif (${part})`,
           chapterMatchStart: match.index,
           chapterMatchEnd: match.index + match[0].length,
@@ -153,6 +329,8 @@ export function parseChapterSegment(text: string): {
         return {
           foundChapterKeyword: true,
           chapters: [],
+          rawChapterExpr: null,
+          chapterDisplay: '-',
           invalidReason: `Rentang chapter terbalik (${start}-${end})`,
           chapterMatchStart: match.index,
           chapterMatchEnd: match.index + match[0].length,
@@ -163,6 +341,8 @@ export function parseChapterSegment(text: string): {
         return {
           foundChapterKeyword: true,
           chapters: [],
+          rawChapterExpr: null,
+          chapterDisplay: '-',
           invalidReason: `Rentang chapter terlalu besar (${count} chapter, batas ${MAX_EXPANDED_CHAPTERS})`,
           chapterMatchStart: match.index,
           chapterMatchEnd: match.index + match[0].length,
@@ -180,6 +360,8 @@ export function parseChapterSegment(text: string): {
         return {
           foundChapterKeyword: true,
           chapters: [],
+          rawChapterExpr: null,
+          chapterDisplay: '-',
           invalidReason: `Nomor chapter di luar batas valid (${part})`,
           chapterMatchStart: match.index,
           chapterMatchEnd: match.index + match[0].length,
@@ -193,6 +375,8 @@ export function parseChapterSegment(text: string): {
       return {
         foundChapterKeyword: true,
         chapters: [],
+        rawChapterExpr: null,
+        chapterDisplay: '-',
         invalidReason: `Format segment chapter tidak dikenali (${part})`,
         chapterMatchStart: match.index,
         chapterMatchEnd: match.index + match[0].length,
@@ -203,6 +387,9 @@ export function parseChapterSegment(text: string): {
   return {
     foundChapterKeyword: true,
     chapters: orderedChapters,
+    rawChapterExpr: rawExpr.trim(),
+    chapterDisplay:
+      orderedChapters.length > 0 ? formatChapterDisplay(rawExpr, orderedChapters) : '-',
     invalidReason: orderedChapters.length === 0 ? 'Daftar chapter kosong' : null,
     chapterMatchStart: match.index,
     chapterMatchEnd: match.index + match[0].length,
@@ -213,10 +400,9 @@ function matchRole(
   text: string,
   roleAliases: RoleAliasEntry[]
 ): { role: RoleName | null; matchedToken: string | null } {
-  // Sort aliases longest first so multi-word or longer aliases match cleanly
   const sorted = [...roleAliases].sort((a, b) => b.alias.length - a.alias.length);
   for (const entry of sorted) {
-    const escaped = entry.alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const escaped = escapeRegex(entry.alias);
     const regex = new RegExp(`\\b${escaped}\\b`, 'i');
     const m = text.match(regex);
     if (m) {
@@ -240,14 +426,13 @@ function matchWorkStatus(text: string): string | null {
   return null;
 }
 
-function findProjectMatch(
+function matchProjectByText(
   candidateText: string,
-  tags: string[],
   projects: ProjectCatalogEntry[]
-): { project: ProjectCatalogEntry | null; matchedVia: string | null; rawCandidate: string } {
+): ProjectCatalogEntry | null {
   const normalizedBody = normalizeText(candidateText);
+  if (!normalizedBody) return null;
 
-  // Build searchable patterns sorted by length descending to prefer exact longer titles
   const candidates: Array<{ pattern: string; project: ProjectCatalogEntry }> = [];
   for (const p of projects) {
     candidates.push({ pattern: normalizeText(p.title), project: p });
@@ -258,41 +443,21 @@ function findProjectMatch(
   }
   candidates.sort((a, b) => b.pattern.length - a.pattern.length);
 
-  // 1. Try matching explicit title/alias in the body text before chapter
-  if (normalizedBody) {
-    for (const item of candidates) {
-      if (
-        normalizedBody === item.pattern ||
-        normalizedBody.includes(item.pattern)
-      ) {
-        return {
-          project: item.project,
-          matchedVia: 'message_text',
-          rawCandidate: candidateText.trim(),
-        };
-      }
+  // Pass 1: exact match first
+  for (const item of candidates) {
+    if (normalizedBody === item.pattern) {
+      return item.project;
     }
   }
 
-  // 2. Try matching leading #tag (like #Solo-Leveling) against project title/aliases
-  for (const tag of tags) {
-    const normTag = normalizeText(tag);
-    for (const item of candidates) {
-      if (normTag === item.pattern) {
-        return {
-          project: item.project,
-          matchedVia: 'leading_tag',
-          rawCandidate: `#${tag}`,
-        };
-      }
+  // Pass 2: word-boundary match for longer titles/aliases
+  for (const item of candidates) {
+    if (matchesPattern(normalizedBody, item.pattern)) {
+      return item.project;
     }
   }
 
-  return {
-    project: null,
-    matchedVia: null,
-    rawCandidate: candidateText.trim(),
-  };
+  return null;
 }
 
 export function parseDiscordReport(
@@ -302,6 +467,10 @@ export function parseDiscordReport(
     channelMappings: ChannelMappingEntry[];
     roleAliases: RoleAliasEntry[];
     explicitMentions?: string[];
+    guildChannelMappings?: GuildChannelMappingEntry[];
+    mentionedChannels?: MentionedChannelInfo[];
+    currentChannelId?: string;
+    currentChannelName?: string | null;
   }
 ): ParsedReportResult {
   const notes: string[] = [];
@@ -309,7 +478,7 @@ export function parseDiscordReport(
     rawContent,
     options.explicitMentions
   );
-  const { tags, body } = extractLeadingChannelTags(stripped);
+  const { mentionedChannelIds, tags, body } = extractChannelReferences(stripped);
 
   const chapterInfo = parseChapterSegment(body);
   const afterChapterText =
@@ -332,6 +501,8 @@ export function parseDiscordReport(
       parseNotes: ['Pesan tidak mengandung kata kunci chapter atau role pekerjaan.'],
       projectId: null,
       projectTitleMatched: null,
+      extractedTitle: null,
+      chapterDisplay: '-',
       role: null,
       roleTokenMatched: null,
       workStatus,
@@ -341,7 +512,6 @@ export function parseDiscordReport(
     };
   }
 
-  // If chapter keyword exists but invalid range/numbers
   if (chapterInfo.foundChapterKeyword && chapterInfo.invalidReason) {
     notes.push(chapterInfo.invalidReason);
   }
@@ -349,69 +519,170 @@ export function parseDiscordReport(
     notes.push('Nomor chapter tidak ditemukan.');
   }
 
-  // Check role
   if (!roleMatch.role) {
     notes.push('Role pekerjaan (ETL/Translator, TS/Editor, atau Solo) tidak dikenali.');
   }
 
-  // Check work status
   if (!workStatus) {
     notes.push('Status penyelesaian (Done/Completed/Finish/Finished) tidak ditemukan.');
   }
 
-  // Identify project from message text / tags and compare with channel mapping
-  const textMatch = findProjectMatch(beforeChapterText, tags, options.projects);
+  const cleanBeforeChapter = sanitizeTitleText(beforeChapterText);
+  const comicTags = tags.filter((tag) => !isNonComicChannel(undefined, tag));
+
   const mappedProjectIds = options.channelMappings.map((m) => m.projectId);
   const defaultMapping =
     options.channelMappings.find((m) => m.isDefault) ??
     (options.channelMappings.length === 1 ? options.channelMappings[0] : null);
 
   let resolvedProjectId: string | null = null;
-  let projectTitleMatched: string | null = textMatch.project?.title ?? null;
+  let projectTitleMatched: string | null = null;
+  let extractedTitle: string | null = null;
   let hasConflict = false;
   let isAmbiguousProject = false;
 
-  if (textMatch.project) {
-    resolvedProjectId = textMatch.project.id;
-    // Conflict check: if channel is mapped strictly to project(s) and none match textMatch.project
-    if (
-      mappedProjectIds.length > 0 &&
-      !mappedProjectIds.includes(textMatch.project.id)
-    ) {
+  const applyMatchedProject = (project: ProjectCatalogEntry) => {
+    resolvedProjectId = project.id;
+    projectTitleMatched = project.title;
+    extractedTitle = project.title;
+    if (mappedProjectIds.length > 0 && !mappedProjectIds.includes(project.id)) {
       hasConflict = true;
       notes.push(
-        `Konflik komik: pesan menyebut "${textMatch.project.title}", sedangkan channel ini ter-mapping ke proyek lain.`
+        `Konflik komik: pesan menyebut "${project.title}", sedangkan channel ini ter-mapping ke proyek lain.`
       );
     }
-  } else if (beforeChapterText.trim().length > 0) {
-    // Message typed an unknown comic name before CH!
+  };
+
+  const applyUnmatchedTitle = (titleCandidate: string) => {
+    extractedTitle = titleCandidate;
     if (defaultMapping && mappedProjectIds.length === 1) {
-      // Unknown title in message vs mapped channel -> flag for admin review
       resolvedProjectId = defaultMapping.projectId;
       hasConflict = true;
       notes.push(
-        `Nama komik "${beforeChapterText.trim()}" tidak dikenal pada daftar komik, perlu pemeriksaan admin.`
+        `Nama komik "${titleCandidate}" tidak dikenal pada daftar komik, perlu pemeriksaan admin.`
       );
     } else {
       isAmbiguousProject = true;
-      notes.push(`Komik "${beforeChapterText.trim()}" tidak ditemukan di database.`);
+      notes.push(`Komik "${titleCandidate}" tidak ditemukan di database.`);
+    }
+  };
+
+  // Priority 1: Explicit comic title written before chapter (e.g. after <#1352988212079104031>)
+  if (cleanBeforeChapter.length > 0) {
+    const matched = matchProjectByText(cleanBeforeChapter, options.projects);
+    if (matched) {
+      applyMatchedProject(matched);
+    } else {
+      applyUnmatchedTitle(cleanBeforeChapter);
+    }
+  } else if (comicTags.length > 0) {
+    // Priority 2: Leading comic hashtag like #Solo-Leveling (excluding #file-tl etc.)
+    let matchedFromTag: ProjectCatalogEntry | null = null;
+    for (const tag of comicTags) {
+      const normalizedTitle = normalizeChannelNameToTitle(tag);
+      const found = matchProjectByText(normalizedTitle, options.projects);
+      if (found) {
+        matchedFromTag = found;
+        break;
+      }
+    }
+    if (matchedFromTag) {
+      applyMatchedProject(matchedFromTag);
+    } else {
+      const normalizedTagTitle = normalizeChannelNameToTitle(comicTags[0]);
+      applyUnmatchedTitle(normalizedTagTitle);
     }
   } else {
-    // Comic name not written in message -> use channel mapping
-    if (defaultMapping) {
-      resolvedProjectId = defaultMapping.projectId;
-      const matchedProj = options.projects.find((p) => p.id === defaultMapping.projectId);
-      projectTitleMatched = matchedProj?.title ?? null;
-    } else if (mappedProjectIds.length > 1) {
-      isAmbiguousProject = true;
-      notes.push('Channel ini terhubung ke lebih dari 1 komik dan nama komik tidak ditulis di pesan.');
-    } else {
-      isAmbiguousProject = true;
-      notes.push('Channel belum di-mapping ke komik dan nama komik tidak ditulis.');
+    // Priority 3: Mentioned Discord comic channel <#channel_id> (excluding #file-tl / non-comic channels)
+    let resolvedFromMentionedChannel = false;
+    const mentionedChannelNameMap = new Map<string, string>();
+    for (const mc of options.mentionedChannels ?? []) {
+      if (mc.id && mc.name) {
+        mentionedChannelNameMap.set(mc.id, mc.name);
+      }
+    }
+
+    for (const chId of mentionedChannelIds) {
+      const dbMappings = (options.guildChannelMappings ?? []).filter(
+        (m) => m.discordChannelId === chId
+      );
+      const knownName =
+        mentionedChannelNameMap.get(chId) ||
+        dbMappings.find((m) => m.channelName)?.channelName ||
+        null;
+
+      if (isNonComicChannel(chId, knownName)) {
+        continue;
+      }
+
+      // 3a. Check if the mentioned channel is mapped to a project in DB
+      const dbDefault =
+        dbMappings.find((m) => m.projectId && m.isDefault) ??
+        dbMappings.find((m) => m.projectId);
+      if (dbDefault?.projectId) {
+        const mappedProj = options.projects.find((p) => p.id === dbDefault.projectId);
+        if (mappedProj) {
+          applyMatchedProject(mappedProj);
+          resolvedFromMentionedChannel = true;
+          break;
+        }
+      }
+
+      // 3b. Otherwise resolve via the mentioned channel's normalized name (e.g. Solo-Leveling -> Solo Leveling)
+      if (knownName) {
+        const normalizedChTitle = normalizeChannelNameToTitle(knownName);
+        if (normalizedChTitle) {
+          const matched = matchProjectByText(normalizedChTitle, options.projects);
+          if (matched) {
+            applyMatchedProject(matched);
+          } else {
+            applyUnmatchedTitle(normalizedChTitle);
+          }
+          resolvedFromMentionedChannel = true;
+          break;
+        }
+      }
+    }
+
+    // Priority 4: Fallback to current channel mapping or current comic channel name
+    if (!resolvedFromMentionedChannel) {
+      if (defaultMapping) {
+        resolvedProjectId = defaultMapping.projectId;
+        const matchedProj = options.projects.find((p) => p.id === defaultMapping.projectId);
+        projectTitleMatched = matchedProj?.title ?? null;
+        extractedTitle = matchedProj?.title ?? null;
+      } else if (mappedProjectIds.length > 1) {
+        isAmbiguousProject = true;
+        notes.push(
+          'Channel ini terhubung ke lebih dari 1 komik dan nama komik tidak ditulis di pesan.'
+        );
+      } else if (
+        options.currentChannelName &&
+        !isNonComicChannel(options.currentChannelId, options.currentChannelName)
+      ) {
+        const normalizedCurrentTitle = normalizeChannelNameToTitle(options.currentChannelName);
+        if (normalizedCurrentTitle) {
+          const matched = matchProjectByText(normalizedCurrentTitle, options.projects);
+          if (matched) {
+            resolvedProjectId = matched.id;
+            projectTitleMatched = matched.title;
+            extractedTitle = matched.title;
+          } else {
+            extractedTitle = normalizedCurrentTitle;
+            isAmbiguousProject = true;
+            notes.push(`Komik "${normalizedCurrentTitle}" belum terdaftar di database.`);
+          }
+        } else {
+          isAmbiguousProject = true;
+          notes.push('Channel belum di-mapping ke komik dan nama komik tidak ditulis.');
+        }
+      } else {
+        isAmbiguousProject = true;
+        notes.push('Channel belum di-mapping ke komik dan nama komik tidak ditulis.');
+      }
     }
   }
 
-  // Determine overall parseStatus
   let parseStatus: ParsedReportResult['parseStatus'] = 'VALID';
   if (chapterInfo.invalidReason || chapterInfo.chapters.length === 0) {
     parseStatus = 'INVALID_CHAPTER';
@@ -431,6 +702,8 @@ export function parseDiscordReport(
     parseNotes: notes,
     projectId: resolvedProjectId,
     projectTitleMatched,
+    extractedTitle,
+    chapterDisplay: chapterInfo.chapterDisplay,
     role: roleMatch.role,
     roleTokenMatched: roleMatch.matchedToken,
     workStatus,

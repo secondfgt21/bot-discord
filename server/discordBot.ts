@@ -8,6 +8,7 @@ import {
   Routes,
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
+  type Message,
   type TextChannel,
 } from 'discord.js';
 import { and, desc, eq, inArray, sql } from 'drizzle-orm';
@@ -63,6 +64,58 @@ let clientInstance: Client | null = null;
 
 export function getBotRuntimeState(): BotRuntimeState {
   return { ...runtimeState };
+}
+
+function getMessageChannelName(message: Message): string | undefined {
+  if ('name' in message.channel && typeof message.channel.name === 'string') {
+    const trimmed = message.channel.name.trim();
+    if (trimmed) return trimmed;
+  }
+  return undefined;
+}
+
+function extractMentionedChannelsFromMessage(
+  message: Message
+): Array<{ id: string; name: string }> {
+  const resolved = new Map<string, string>();
+  for (const [id, ch] of message.mentions.channels) {
+    if ('name' in ch && typeof ch.name === 'string' && ch.name.trim()) {
+      resolved.set(id, ch.name.trim());
+    }
+  }
+  const channelMentionRegex = /<#(\d+)>/g;
+  let match: RegExpExecArray | null;
+  while ((match = channelMentionRegex.exec(message.content)) !== null) {
+    const id = match[1];
+    if (!resolved.has(id)) {
+      const cached = message.guild?.channels.cache.get(id);
+      if (cached && 'name' in cached && typeof cached.name === 'string' && cached.name.trim()) {
+        resolved.set(id, cached.name.trim());
+      }
+    }
+  }
+  return Array.from(resolved.entries()).map(([id, name]) => ({ id, name }));
+}
+
+export function formatReportAcceptedMessage(params: {
+  discordAuthorId: string;
+  projectTitle?: string | null;
+  chapterDisplay?: string | null;
+  totalChapters?: number;
+}): string {
+  const title = params.projectTitle?.trim() || '-';
+  const chapter = params.chapterDisplay?.trim() || '-';
+  const totalChapter =
+    typeof params.totalChapters === 'number' && Number.isFinite(params.totalChapters)
+      ? Math.max(0, Math.trunc(params.totalChapters))
+      : 0;
+
+  return [
+    `<@${params.discordAuthorId}> Laporan Diterima`,
+    `judul : ${title}`,
+    `chapter : ${chapter}`,
+    `total chapter : ${totalChapter}`,
+  ].join('\n');
 }
 
 async function isDiscordAdmin(
@@ -284,11 +337,13 @@ export async function syncMissedMessages(db: AppDb, client: Client): Promise<voi
           discordMessageId: m.id,
           discordGuildId: m.guildId || '',
           discordChannelId: m.channelId,
+          discordChannelName: textCh.name,
           discordAuthorId: m.author.id,
           authorUsername: m.author.username,
           authorDisplayName: m.member?.displayName || m.author.displayName || m.author.username,
           content: m.content,
           mentions: m.mentions.users.map((u) => `<@${u.id}>`),
+          mentionedChannels: extractMentionedChannelsFromMessage(m),
           messageTimestamp: new Date(m.createdTimestamp).toISOString(),
           messageUrl: m.url,
         });
@@ -880,21 +935,26 @@ export async function startDiscordBotIfConfigured(db: AppDb): Promise<void> {
           discordMessageId: message.id,
           discordGuildId: message.guildId,
           discordChannelId: message.channelId,
+          discordChannelName: getMessageChannelName(message),
           discordAuthorId: message.author.id,
           authorUsername: message.author.username,
           authorDisplayName: message.member?.displayName || message.author.displayName || message.author.username,
           content: message.content,
           mentions: message.mentions.users.map((u) => `<@${u.id}>`),
+          mentionedChannels: extractMentionedChannelsFromMessage(message),
           messageTimestamp: new Date(message.createdTimestamp).toISOString(),
           messageUrl: message.url,
         });
-        if (res && typeof res === 'object' && 'outcome' in res) {
-          const outcome = String((res as { outcome?: string }).outcome || '');
-          if (outcome && !outcome.startsWith('IGNORED')) {
-            await message.reply(`<@${message.author.id}> laporanmu diterima`).catch((err) =>
-              console.error('[DiscordBot] Reply error:', err)
-            );
-          }
+        if (res.outcome === 'PROCESSED') {
+          const replyText = formatReportAcceptedMessage({
+            discordAuthorId: message.author.id,
+            projectTitle: res.projectTitle,
+            chapterDisplay: res.chapterDisplay,
+            totalChapters: res.totalChapters,
+          });
+          await message.reply(replyText).catch((err) =>
+            console.error('[DiscordBot] Reply error:', err)
+          );
         }
       } catch (err) {
         console.error('[DiscordBot] MessageCreate error:', err);
@@ -908,11 +968,13 @@ export async function startDiscordBotIfConfigured(db: AppDb): Promise<void> {
         discordMessageId: full.id,
         discordGuildId: full.guildId,
         discordChannelId: full.channelId,
+        discordChannelName: getMessageChannelName(full),
         discordAuthorId: full.author.id,
         authorUsername: full.author.username,
         authorDisplayName: full.member?.displayName || full.author.displayName || full.author.username,
         content: full.content,
         mentions: full.mentions.users.map((u) => `<@${u.id}>`),
+        mentionedChannels: extractMentionedChannelsFromMessage(full),
         messageTimestamp: new Date(full.createdTimestamp).toISOString(),
         messageUrl: full.url,
       });

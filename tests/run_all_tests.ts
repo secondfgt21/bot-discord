@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { eq, sql } from 'drizzle-orm';
 import { createTestPgDb, seedGuildDefaults } from '../server/db.ts';
+import { formatReportAcceptedMessage } from '../server/discordBot.ts';
 import { parseDiscordReport } from '../server/parser.ts';
 import {
   closePayrollPeriod,
@@ -195,6 +196,126 @@ async function runTests() {
     });
     assert.equal(r.isReport, false);
     assert.equal(r.parseStatus, 'NOT_A_REPORT');
+  });
+
+  await test('13b. <#1352988212079104031> (#file-tl) + BOM \\uFEFF + CH 08, ETL Done <@user>', () => {
+    const input =
+      '<#1352988212079104031> \uFEFFGlobal Class Change: I Am the Invincible Shadow Monarch CH 08, ETL Done <@687369494250782803>';
+    const r = parseDiscordReport(input, {
+      projects: testProjects,
+      channelMappings: [],
+      roleAliases: testRoleAliases,
+      mentionedChannels: [{ id: '1352988212079104031', name: 'file-tl' }],
+      currentChannelId: '1352988212079104031',
+      currentChannelName: 'file-tl',
+    });
+    assert.equal(r.isReport, true);
+    assert.equal(r.extractedTitle, 'Global Class Change: I Am the Invincible Shadow Monarch');
+    assert.equal(r.chapterDisplay, '08');
+    assert.deepEqual(r.chapters, [8]);
+    assert.equal(r.chapters.length, 1);
+    assert.equal(r.role, 'Translator');
+    assert.deepEqual(r.mentions, ['<@687369494250782803>']);
+
+    const reply = formatReportAcceptedMessage({
+      discordAuthorId: '687369494250782803',
+      projectTitle: r.projectTitleMatched ?? r.extractedTitle,
+      chapterDisplay: r.chapterDisplay,
+      totalChapters: r.chapters.length,
+    });
+    assert.equal(
+      reply,
+      [
+        '<@687369494250782803> Laporan Diterima',
+        'judul : Global Class Change: I Am the Invincible Shadow Monarch',
+        'chapter : 08',
+        'total chapter : 1',
+      ].join('\n')
+    );
+  });
+
+  await test('13c. #Solo-Leveling & <#channel_id> comic channel normalization + CH 4-5 -> total 2', () => {
+    const rTag = parseDiscordReport('#Solo-Leveling CH 4-5 ETL Done @Controller', {
+      projects: testProjects,
+      channelMappings: [],
+      roleAliases: testRoleAliases,
+    });
+    assert.equal(rTag.parseStatus, 'VALID');
+    assert.equal(rTag.projectId, 'p-sl');
+    assert.equal(rTag.projectTitleMatched, 'Solo Leveling');
+    assert.equal(rTag.chapterDisplay, '4-5');
+    assert.deepEqual(rTag.chapters, [4, 5]);
+    assert.equal(rTag.chapters.length, 2);
+
+    // Unmapped #Solo-Leveling (not yet in projects list) still normalizes cleanly to "Solo Leveling"
+    const rTagUnmapped = parseDiscordReport('#Solo-Leveling CH 4-5 ETL Done', {
+      projects: [],
+      channelMappings: [],
+      roleAliases: testRoleAliases,
+    });
+    assert.equal(rTagUnmapped.extractedTitle, 'Solo Leveling');
+    assert.equal(rTagUnmapped.chapterDisplay, '4-5');
+    assert.equal(rTagUnmapped.chapters.length, 2);
+
+    // Mentioned Discord comic channel <#1280000000000000101> with channel name "Solo-Leveling"
+    const rMentionMapped = parseDiscordReport('<#1280000000000000101> CH 4-5 ETL Done', {
+      projects: testProjects,
+      channelMappings: [],
+      guildChannelMappings: [
+        {
+          discordChannelId: '1280000000000000101',
+          channelName: '#solo-leveling',
+          projectId: 'p-sl',
+          isDefault: true,
+        },
+      ],
+      roleAliases: testRoleAliases,
+    });
+    assert.equal(rMentionMapped.parseStatus, 'VALID');
+    assert.equal(rMentionMapped.projectTitleMatched, 'Solo Leveling');
+    assert.equal(rMentionMapped.chapterDisplay, '4-5');
+    assert.equal(rMentionMapped.chapters.length, 2);
+
+    // Mentioned Discord comic channel not in DB, resolved via Discord channel name "solo-leveling"
+    const rMentionName = parseDiscordReport('<#1280000000000000999> CH 4-5 ETL Done', {
+      projects: [],
+      channelMappings: [],
+      roleAliases: testRoleAliases,
+      mentionedChannels: [{ id: '1280000000000000999', name: 'solo-leveling' }],
+    });
+    assert.equal(rMentionName.extractedTitle, 'Solo Leveling');
+    assert.equal(rMentionName.chapterDisplay, '4-5');
+    assert.equal(rMentionName.chapters.length, 2);
+
+    const reply = formatReportAcceptedMessage({
+      discordAuthorId: '687369494250782803',
+      projectTitle: rTag.projectTitleMatched ?? rTag.extractedTitle,
+      chapterDisplay: rTag.chapterDisplay,
+      totalChapters: rTag.chapters.length,
+    });
+    assert.equal(
+      reply,
+      [
+        '<@687369494250782803> Laporan Diterima',
+        'judul : Solo Leveling',
+        'chapter : 4-5',
+        'total chapter : 2',
+      ].join('\n')
+    );
+  });
+
+  await test('13d. <#1352988212079104031> (#file-tl) alone without comic title is NEVER used as comic title', () => {
+    const r = parseDiscordReport('<#1352988212079104031> CH 08 ETL Done', {
+      projects: testProjects,
+      channelMappings: [],
+      roleAliases: testRoleAliases,
+      mentionedChannels: [{ id: '1352988212079104031', name: 'file-tl' }],
+      currentChannelId: '1352988212079104031',
+      currentChannelName: 'file-tl',
+    });
+    assert.equal(r.parseStatus, 'AMBIGUOUS_PROJECT');
+    assert.equal(r.projectId, null);
+    assert.equal(r.extractedTitle, null);
   });
 
   // =========================================================================
@@ -495,6 +616,83 @@ async function runTests() {
         .where(eq(payrollPeriods.id, currPeriod.id))
         .limit(1);
       assert.equal(pAfter.status, 'REOPENED');
+    });
+
+    await test('18. End-to-End #file-tl (<#1352988212079104031>) & #Solo-Leveling report processing + reply payload', async () => {
+      const fileTlChannelId = '1352988212079104031';
+      await db.insert(channelMappings).values({
+        guildId: guild.id,
+        discordChannelId: fileTlChannelId,
+        channelName: '#file-tl',
+        projectId: null,
+        isReportChannel: true,
+        isDefault: false,
+      });
+
+      const resFileTl = await processDiscordReport(db, {
+        discordMessageId: '900000000000000101',
+        discordGuildId: guild.discordGuildId,
+        discordChannelId: fileTlChannelId,
+        discordChannelName: 'file-tl',
+        discordAuthorId: '687369494250782803',
+        authorUsername: 'pelapor_tl',
+        authorDisplayName: 'Pelapor TL',
+        content:
+          '<#1352988212079104031> \uFEFFGlobal Class Change: I Am the Invincible Shadow Monarch CH 08, ETL Done <@687369494250782803>',
+        mentionedChannels: [{ id: fileTlChannelId, name: 'file-tl' }],
+      });
+
+      assert.equal(resFileTl.outcome, 'PROCESSED');
+      assert.equal(resFileTl.parseStatus, 'VALID');
+      assert.equal(
+        resFileTl.projectTitle,
+        'Global Class Change: I Am the Invincible Shadow Monarch'
+      );
+      assert.equal(resFileTl.chapterDisplay, '08');
+      assert.equal(resFileTl.totalChapters, 1);
+      assert.equal(resFileTl.totalAmountIdr, 4500);
+
+      // Second different comic reported in the same #file-tl channel must NOT conflict
+      const resSecondInFileTl = await processDiscordReport(db, {
+        discordMessageId: '900000000000000102',
+        discordGuildId: guild.discordGuildId,
+        discordChannelId: fileTlChannelId,
+        discordChannelName: 'file-tl',
+        discordAuthorId: '687369494250782803',
+        authorUsername: 'pelapor_tl',
+        authorDisplayName: 'Pelapor TL',
+        content: `<#${chSlId}> CH 4-5 ETL Done <@687369494250782803>`,
+        mentionedChannels: [{ id: chSlId, name: 'Solo-Leveling' }],
+      });
+
+      assert.equal(resSecondInFileTl.outcome, 'PROCESSED');
+      assert.equal(resSecondInFileTl.parseStatus, 'VALID');
+      assert.equal(resSecondInFileTl.projectTitle, 'Solo Leveling');
+      assert.equal(resSecondInFileTl.chapterDisplay, '4-5');
+      assert.equal(resSecondInFileTl.totalChapters, 2);
+      assert.equal(resSecondInFileTl.totalAmountIdr, 9000);
+
+      const reply1 = formatReportAcceptedMessage({
+        discordAuthorId: '687369494250782803',
+        projectTitle: resFileTl.projectTitle,
+        chapterDisplay: resFileTl.chapterDisplay,
+        totalChapters: resFileTl.totalChapters,
+      });
+      assert.equal(
+        reply1,
+        '<@687369494250782803> Laporan Diterima\njudul : Global Class Change: I Am the Invincible Shadow Monarch\nchapter : 08\ntotal chapter : 1'
+      );
+
+      const reply2 = formatReportAcceptedMessage({
+        discordAuthorId: '687369494250782803',
+        projectTitle: resSecondInFileTl.projectTitle,
+        chapterDisplay: resSecondInFileTl.chapterDisplay,
+        totalChapters: resSecondInFileTl.totalChapters,
+      });
+      assert.equal(
+        reply2,
+        '<@687369494250782803> Laporan Diterima\njudul : Solo Leveling\nchapter : 4-5\ntotal chapter : 2'
+      );
     });
 
     console.log(`\nALL ${passed} CORE POSTGRESQL & PAYROLL TEST SUITES PASSED.`);

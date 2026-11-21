@@ -17,6 +17,8 @@ export interface ParsedReportResult {
   parseNotes: string[];
   projectId: string | null;
   projectTitleMatched: string | null;
+  extractedTitle: string | null;
+  chapterDisplay: string;
   role: RoleName | null;
   roleTokenMatched: string | null;
   workStatus: string | null;
@@ -29,11 +31,13 @@ export interface IncomingDiscordMessage {
   discordMessageId: string;
   discordGuildId: string;
   discordChannelId: string;
+  discordChannelName?: string;
   discordAuthorId: string;
   authorUsername: string;
   authorDisplayName: string;
   content: string;
   mentions?: string[];
+  mentionedChannels?: Array<{ id: string; name: string }>;
   messageTimestamp?: string;
   messageUrl?: string;
 }
