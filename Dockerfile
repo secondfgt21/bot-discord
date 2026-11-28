@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Copy package manifests and install dependencies
 COPY package.json package-lock.json ./
-RUN npm ci
+RUN npm ci --legacy-peer-deps
 
 # Copy application source & build Vite frontend
 COPY . .
