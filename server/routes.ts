@@ -572,6 +572,225 @@ export function createApiRouter(db: AppDb): Router {
   );
 
   // ============================================================================
+  // SHEET REKAP (GOOGLE SHEETS STYLE)
+  // ============================================================================
+  router.get(
+    '/rekap-sheet',
+    asyncRoute(async (req: Request, res: Response) => {
+      const guild = await getPrimaryGuild(db);
+      const jakarta = getJakartaDateParts();
+      const year = Number(req.query.year) || jakarta.year;
+      const month = Number(req.query.month) || jakarta.month;
+      const periodKey = `${year}-${String(month).padStart(2, '0')}`;
+
+      if (!guild) {
+        res.json({
+          summary: { totalChapters: 0, totalSalary: 0, problemReportsCount: 0, periodCode: periodKey },
+          byRole: [],
+          yearlySummary: [],
+          byMember: [],
+          reports: [],
+          rawSubmissions: [],
+          rates: { Translator: 3000, Editor: 3000, Solo: 6000 },
+          periods: [],
+          roleAliases: [],
+        });
+        return;
+      }
+
+      const periodRows = await db
+        .select()
+        .from(payrollPeriods)
+        .where(and(eq(payrollPeriods.guildId, guild.id), eq(payrollPeriods.periodKey, periodKey)))
+        .limit(1);
+
+      const period = periodRows[0];
+      const periodId = period?.id;
+
+      let totalChapters = 0;
+      let totalSalary = 0;
+      let problemReportsCount = 0;
+
+      if (periodId) {
+        const [sumRow] = (
+          await db.execute(sql`
+            SELECT COALESCE(SUM(total_chapters), 0)::int AS ch,
+                   COALESCE(SUM(net_amount_idr), 0)::int AS sal
+            FROM payroll_records
+            WHERE period_id = ${periodId}
+          `)
+        ).rows as Array<{ ch: number; sal: number }>;
+        totalChapters = sumRow?.ch ?? 0;
+        totalSalary = sumRow?.sal ?? 0;
+      }
+
+      const [probRow] = (
+        await db.execute(sql`
+          SELECT COUNT(*)::int AS cnt
+          FROM report_chapters rc
+          JOIN reports r ON r.id = rc.report_id
+          WHERE r.guild_id = ${guild.id}
+            AND TO_CHAR(r.message_timestamp AT TIME ZONE 'Asia/Jakarta', 'YYYY-MM') = ${periodKey}
+            AND (rc.approval_status = 'pending' OR rc.duplicate_flag = TRUE)
+        `)
+      ).rows as Array<{ cnt: number }>;
+      problemReportsCount = probRow?.cnt ?? 0;
+
+      const rates = await getActiveRatesMap(db, guild.id);
+      const roleRows = periodId
+        ? (
+            await db.execute(sql`
+              SELECT rc.role,
+                     COUNT(rc.id)::int AS chapters,
+                     COALESCE(SUM(rc.amount_idr), 0)::int AS salary
+              FROM report_chapters rc
+              WHERE rc.period_id = ${periodId} AND rc.approval_status IN ('auto_approved', 'approved') AND rc.role IS NOT NULL
+              GROUP BY rc.role
+            `)
+          ).rows
+        : [];
+
+      const roleMap = new Map<string, { chapters: number; salary: number }>();
+      for (const r of roleRows as Array<{ role: string; chapters: number; salary: number }>) {
+        roleMap.set(r.role, { chapters: r.chapters, salary: r.salary });
+      }
+
+      const rolesList = ['Translator', 'Editor', 'Solo', 'Bonus'];
+      const byRole = rolesList.map((role) => {
+        const data = roleMap.get(role) || { chapters: 0, salary: 0 };
+        const rate = rates[role as RoleName] || (role === 'Bonus' ? 0 : 3000);
+        return {
+          role,
+          rate,
+          chapters: data.chapters,
+          salary: data.salary || (role === 'Bonus' ? 0 : data.chapters * rate),
+        };
+      });
+
+      const yearlyRows = (
+        await db.execute(sql`
+          SELECT pp.month,
+                 COALESCE(SUM(pr.total_chapters), 0)::int AS chapters,
+                 COALESCE(SUM(pr.net_amount_idr), 0)::int AS salary
+          FROM payroll_periods pp
+          LEFT JOIN payroll_records pr ON pr.period_id = pp.id
+          WHERE pp.guild_id = ${guild.id} AND pp.year = ${year}
+          GROUP BY pp.month
+          ORDER BY pp.month ASC
+        `)
+      ).rows as Array<{ month: number; chapters: number; salary: number }>;
+
+      const monthNames = [
+        '',
+        'Januari',
+        'Februari',
+        'Maret',
+        'April',
+        'Mei',
+        'Juni',
+        'Juli',
+        'Agustus',
+        'September',
+        'Oktober',
+        'November',
+        'Desember',
+      ];
+
+      const yearlySummary = Array.from({ length: 12 }, (_, i) => {
+        const m = i + 1;
+        const found = yearlyRows.find((y) => y.month === m);
+        return {
+          month: m,
+          monthName: monthNames[m],
+          chapters: found?.chapters ?? 0,
+          salary: found?.salary ?? 0,
+          isActive: m === month,
+        };
+      });
+
+      const byMember = periodId
+        ? (
+            await db.execute(sql`
+              SELECT m.id AS employee_id, m.display_name AS name,
+                     pr.total_chapters::int AS chapters,
+                     pr.net_amount_idr::int AS salary,
+                     pr.payment_status,
+                     pr.paid_amount_idr::int AS paid_amount,
+                     pr.remaining_amount_idr::int AS remaining_amount,
+                     pr.id AS payroll_record_id
+              FROM payroll_records pr
+              JOIN members m ON m.id = pr.member_id
+              WHERE pr.period_id = ${periodId}
+              ORDER BY pr.total_chapters DESC, m.display_name ASC
+            `)
+          ).rows
+        : [];
+
+      const reports = periodId
+        ? (
+            await db.execute(sql`
+              SELECT r.id, r.message_timestamp, m.display_name AS name, rc.role,
+                     COALESCE(p.title, 'Komik Lain') AS comic_title,
+                     rc.chapter_number, pp.period_key, rc.unit_rate_idr AS rate,
+                     rc.approval_status AS cek, m.display_name AS normalized_name,
+                     rc.duplicate_flag, rc.amount_idr
+              FROM report_chapters rc
+              JOIN reports r ON r.id = rc.report_id
+              JOIN members m ON m.id = rc.member_id
+              JOIN payroll_periods pp ON pp.id = rc.period_id
+              LEFT JOIN projects p ON p.id = rc.project_id
+              WHERE rc.period_id = ${periodId}
+              ORDER BY r.message_timestamp DESC
+              LIMIT 150
+            `)
+          ).rows
+        : [];
+
+      const rawSubmissions = (
+        await db.execute(sql`
+          SELECT r.id, r.message_timestamp AS timestamp, r.author_display_name AS name,
+                 r.raw_content, r.parse_status, p.title AS project_title, r.message_url
+          FROM reports r
+          LEFT JOIN projects p ON p.id = r.project_id
+          WHERE r.guild_id = ${guild.id}
+            AND TO_CHAR(r.message_timestamp AT TIME ZONE 'Asia/Jakarta', 'YYYY-MM') = ${periodKey}
+          ORDER BY r.message_timestamp DESC
+          LIMIT 150
+        `)
+      ).rows;
+
+      const periods = (
+        await db.execute(sql`
+          SELECT * FROM payroll_periods WHERE guild_id = ${guild.id} ORDER BY year DESC, month DESC
+        `)
+      ).rows;
+
+      const roleAliasesList = (
+        await db.execute(sql`
+          SELECT * FROM role_aliases WHERE guild_id = ${guild.id} ORDER BY role ASC, alias ASC
+        `)
+      ).rows;
+
+      res.json({
+        summary: {
+          totalChapters,
+          totalSalary,
+          problemReportsCount,
+          periodCode: periodKey,
+        },
+        byRole,
+        yearlySummary,
+        byMember,
+        reports,
+        rawSubmissions,
+        rates,
+        periods,
+        roleAliases: roleAliasesList,
+      });
+    })
+  );
+
+  // ============================================================================
   // EMPLOYEES
   // ============================================================================
   router.get(

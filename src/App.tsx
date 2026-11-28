@@ -5,6 +5,7 @@ import {
   BookOpen,
   CheckCheck,
   CreditCard,
+  FileSpreadsheet,
   FileText,
   LayoutDashboard,
   Loader2,
@@ -25,12 +26,14 @@ import { PayrollView } from './components/PayrollView.tsx';
 import { ProjectsView } from './components/ProjectsView.tsx';
 import { ReportsView } from './components/ReportsView.tsx';
 import { SettingsView } from './components/SettingsView.tsx';
+import { SheetRekapView } from './components/SheetRekapView.tsx';
 import { StatusBadge, ToastProvider, useToast } from './components/ui/DashboardUI.tsx';
 import { apiFetch, formatJakartaDateTime, getStoredToken, setStoredToken } from './lib/api.ts';
 import type { AuthUser, Period } from './types.ts';
 
 type TabKey =
   | 'overview'
+  | 'sheet-rekap'
   | 'employees'
   | 'projects'
   | 'reports'
@@ -56,6 +59,7 @@ const NAV_GROUPS: Array<{
     title: 'Utama',
     items: [
       { key: 'overview', label: 'Ringkasan', icon: LayoutDashboard },
+      { key: 'sheet-rekap', label: 'Sheet Rekap', icon: FileSpreadsheet },
       { key: 'reports', label: 'Laporan Discord', icon: FileText },
       { key: 'payroll', label: 'Payroll Bulanan', icon: Receipt },
       { key: 'payments', label: 'Riwayat Pembayaran', icon: CreditCard },
@@ -357,6 +361,7 @@ function AppShell() {
               }}
             />
           )}
+          {activeTab === 'sheet-rekap' && <SheetRekapView user={user} periods={periods} />}
           {activeTab === 'employees' && <EmployeesView user={user} />}
           {activeTab === 'projects' && <ProjectsView user={user} />}
           {activeTab === 'reports' && (
