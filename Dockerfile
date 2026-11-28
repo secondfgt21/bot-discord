@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Copy package manifests and install dependencies
 COPY package.json package-lock.json ./
-RUN npm install --legacy-peer-deps && npm install --no-save --legacy-peer-deps @rolldown/binding-linux-x64-musl
+RUN npm install --legacy-peer-deps && npm install --no-save --legacy-peer-deps @rolldown/binding-linux-x64-musl lightningcss-linux-x64-musl
 
 # Copy application source & build Vite frontend
 COPY . .
